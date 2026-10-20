@@ -1,0 +1,3053 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SAFE — Identity Verification</title>
+<!-- Leaflet + OpenStreetMap tiles: renders the GPS-vs-IP location
+     consistency map (see renderLocationConsistency()). No API key needed.
+     Only actually initialized when both points resolve to real coordinates
+     -- Mock Mode / private-IP / lookup-failure sessions show a plain
+     placeholder instead (see IP_GEO note in mock_server.py) rather than
+     loading tiles for data that isn't real. -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+:root {
+  --bg: #0F1219; --surface: #1A2233; --surface2: #212D42;
+  --border: #2A3A52; --border-light: #374d6b;
+  --text: #C8D6E8; --text-dim: #7A90AA; --text-bright: #E8F0F8;
+  --accent: #E8A020; --accent-dim: rgba(232,160,32,0.15); --accent-border: rgba(232,160,32,0.4);
+  --cyan: #4DB8C8; --cyan-dim: rgba(77,184,200,0.12);
+  --green: #3DB87A; --green-dim: rgba(61,184,122,0.12);
+  --red: #E85555; --red-dim: rgba(232,85,85,0.12);
+  --purple: #7F77DD; --purple-dim: rgba(127,119,221,0.12);
+  --mono: 'JetBrains Mono','Fira Code','Consolas',monospace;
+  --sans: 'Inter','Segoe UI',system-ui,sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13.5px;min-height:100vh;}
+
+/* ── HEADER ── */
+#app-header{background:var(--surface);border-bottom:1px solid var(--border);padding:0 28px;display:flex;align-items:center;gap:16px;height:52px;position:sticky;top:0;z-index:100;}
+.logo-square{width:28px;height:28px;background:var(--accent);display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:11px;font-weight:700;color:#000;}
+.logo-text{font-family:var(--mono);font-size:13px;font-weight:600;color:var(--text-bright);letter-spacing:0.08em;}
+.logo-sub{font-size:10px;color:var(--text-dim);font-family:var(--mono);}
+.hdr-sep{flex:1;}
+.hdr-badge{font-family:var(--mono);font-size:10px;color:var(--text-dim);padding:3px 8px;border:1px solid var(--border);background:var(--bg);}
+
+/* ── PAGES ── */
+.page{display:none;} .page.active{display:block;}
+
+/* ── INTRO PAGE ── */
+#page-intro{max-width:600px;margin:0 auto;padding:60px 28px;}
+.intro-title{font-family:var(--mono);font-size:22px;font-weight:700;color:var(--text-bright);margin-bottom:8px;}
+.intro-sub{color:var(--text-dim);font-size:14px;margin-bottom:36px;line-height:1.6;}
+.intro-steps{display:flex;flex-direction:column;gap:12px;margin-bottom:36px;}
+.step-card{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--cyan);padding:14px 18px;display:flex;gap:14px;align-items:flex-start;}
+.step-num{font-family:var(--mono);font-size:18px;font-weight:700;color:var(--cyan);min-width:24px;}
+.step-title{font-family:var(--mono);font-size:11px;font-weight:700;color:var(--text-bright);letter-spacing:0.06em;margin-bottom:3px;}
+.step-desc{font-size:12px;color:var(--text-dim);line-height:1.5;}
+.btn-primary{background:var(--accent);color:#000;border:none;padding:12px 36px;font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;cursor:pointer;transition:background 0.15s;}
+.btn-primary:hover{background:#f0b030;}
+.btn-secondary{background:transparent;color:var(--cyan);border:1px solid var(--cyan);padding:10px 24px;font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;cursor:pointer;transition:all 0.15s;}
+.btn-secondary:hover{background:var(--cyan-dim);}
+
+/* ── PERMISSIONS PAGE ── */
+#page-permissions{max-width:520px;margin:0 auto;padding:60px 28px;}
+.perm-card{background:var(--surface);border:1px solid var(--border);padding:24px;margin-bottom:16px;}
+.perm-icon{font-size:28px;margin-bottom:10px;}
+.perm-title{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--text-bright);margin-bottom:6px;}
+.perm-desc{font-size:12px;color:var(--text-dim);line-height:1.5;margin-bottom:14px;}
+.perm-status{font-family:var(--mono);font-size:10px;letter-spacing:0.08em;text-transform:uppercase;padding:4px 10px;display:inline-block;}
+.perm-status.pending{color:var(--text-dim);border:1px solid var(--border);}
+.perm-status.granted{color:var(--green);border:1px solid rgba(61,184,122,0.3);background:var(--green-dim);}
+.perm-status.denied{color:var(--red);border:1px solid rgba(232,85,85,0.3);background:var(--red-dim);}
+.perm-status.na{color:var(--text-dim);border:1px solid var(--border);}
+
+/* ── CAPTURE PAGE ── */
+#page-capture{max-width:780px;margin:0 auto;padding:32px 28px;}
+.capture-layout{display:grid;grid-template-columns:1fr 280px;gap:24px;align-items:start;}
+/* mobile query moved below */
+.camera-wrap{position:relative;background:#000;aspect-ratio:4/3;overflow:hidden;}
+#camera-video{width:100%;height:100%;object-fit:cover;display:block;}
+#camera-video.mirrored{transform:scaleX(-1);}
+#camera-canvas.mirrored{transform:scaleX(-1);}
+#camera-canvas{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;}
+.camera-overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:none;}
+/* Face guide oval */
+.face-guide{width:140px;height:180px;border:2px solid rgba(77,184,200,0.5);border-radius:50%;margin-bottom:16px;transition:border-color 0.3s;}
+@media(max-width:700px){.face-guide{width:180px;height:230px;}}
+.face-guide.active{border-color:var(--cyan);box-shadow:0 0 0 1px rgba(77,184,200,0.2);}
+.face-guide.pass{border-color:var(--green);box-shadow:0 0 0 1px rgba(61,184,122,0.2);}
+
+/* Challenge display */
+.challenge-panel{background:var(--surface);border:1px solid var(--border);padding:0;}
+.challenge-header{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;}
+.challenge-title{font-family:var(--mono);font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--text-dim);}
+.challenge-progress{display:flex;gap:4px;}
+.cp-dot{width:8px;height:8px;border-radius:50%;background:var(--border);transition:background 0.2s;}
+.cp-dot.done{background:var(--green);}
+.cp-dot.active{background:var(--accent);}
+.challenge-body{padding:20px 16px;}
+.challenge-icon{font-size:36px;margin-bottom:12px;display:block;text-align:center;}
+.challenge-prompt{font-family:var(--mono);font-size:14px;font-weight:700;color:var(--text-bright);text-align:center;margin-bottom:8px;line-height:1.3;}
+@media(max-width:700px){.challenge-prompt{font-size:18px;}}
+.challenge-hint{font-size:11px;color:var(--text-dim);text-align:center;margin-bottom:16px;line-height:1.4;}
+/* Countdown ring */
+.countdown-wrap{display:flex;justify-content:center;margin-bottom:16px;}
+.countdown-ring{position:relative;width:64px;height:64px;}
+.countdown-ring svg{transform:rotate(-90deg);}
+.countdown-ring circle{fill:none;stroke:var(--border);stroke-width:4;}
+.countdown-ring .progress{stroke:var(--accent);stroke-width:4;stroke-linecap:round;transition:stroke-dashoffset 0.1s linear;}
+.countdown-num{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:20px;font-weight:700;color:var(--text-bright);}
+/* Challenge status */
+.challenge-status{font-family:var(--mono);font-size:11px;text-align:center;padding:6px 12px;letter-spacing:0.06em;}
+.challenge-status.watching{color:var(--text-dim);}
+.challenge-status.pass{color:var(--green);background:var(--green-dim);}
+.challenge-status.fail{color:var(--red);background:var(--red-dim);}
+/* IMU meters — client-facing build: this raw gyro/accelerometer readout was
+   a dev/reviewer instrument shown live next to the camera preview during
+   capture. It's still measured and recorded (the same IMU/optical
+   correlation numbers appear, unlabeled as "gyro/accel", in the final
+   report's telemetry sections) but the live per-axis meters next to the
+   camera itself have no place in a client-facing capture screen, on any
+   screen size -- previously this only hid below 700px width. */
+.imu-section{display:none !important;}
+@media(max-width:700px){
+  .capture-layout{grid-template-columns:1fr;gap:14px;}
+  .camera-wrap{aspect-ratio:unset !important;height:auto;overflow:visible;}
+  .camera-wrap video{width:100% !important;height:auto !important;object-fit:cover;display:block;}
+  #page-capture .challenge-panel{max-height:none;}
+  #page-capture>div{padding:12px 14px;}
+}
+.imu-label{font-family:var(--mono);font-size:9px;letter-spacing:0.1em;text-transform:uppercase;color:var(--text-dim);margin-bottom:8px;}
+.imu-meter{display:flex;align-items:center;gap:8px;margin-bottom:6px;}
+.imu-axis{font-family:var(--mono);font-size:9px;color:var(--text-dim);min-width:16px;}
+.imu-bar-wrap{flex:1;height:4px;background:var(--surface2);}
+.imu-bar{height:100%;background:var(--cyan);transition:width 0.1s;max-width:100%;}
+.imu-val{font-family:var(--mono);font-size:9px;color:var(--text-dim);min-width:44px;text-align:right;}
+/* Processing overlay */
+.processing-overlay{position:fixed;inset:0;background:rgba(15,18,25,0.92);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:200;}
+.processing-spinner{width:48px;height:48px;border:3px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:spin 0.8s linear infinite;margin-bottom:20px;}
+@keyframes spin{to{transform:rotate(360deg);}}
+.processing-label{font-family:var(--mono);font-size:12px;color:var(--text-dim);letter-spacing:0.08em;}
+/* Confirmation page (v67) */
+#page-confirmation{min-height:100vh;display:flex;align-items:center;justify-content:center;}
+.confirm-wrap{max-width:440px;width:100%;text-align:center;padding:32px 28px;}
+.processing-spinner-standalone{width:40px;height:40px;border:3px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:spin 0.8s linear infinite;margin:0 auto 20px;}
+.confirm-icon{font-size:36px;margin-bottom:14px;}
+.confirm-icon-success{color:var(--green);}
+.confirm-icon-error{color:var(--red);}
+.confirm-title{font-family:var(--mono);font-size:16px;font-weight:700;color:var(--text-bright);margin-bottom:10px;}
+.confirm-body{font-size:13px;color:var(--text-dim);line-height:1.6;margin-bottom:24px;}
+.confirm-demo-note{font-family:var(--mono);font-size:9px;color:var(--text-dim);opacity:0.6;line-height:1.5;margin-top:18px;}
+.confirm-startover{margin-top:14px;font-family:var(--mono);font-size:11px;}
+.confirm-startover a{color:var(--text-dim);}
+
+/* ── REPORT PAGE ── */
+#page-report .report-header{padding:16px 28px;background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:16px;}
+.report-title{font-family:var(--mono);font-size:11px;color:var(--text-dim);letter-spacing:0.1em;text-transform:uppercase;}
+.report-subject{font-family:var(--mono);font-size:13px;color:var(--text-bright);font-weight:600;}
+.hdr-sep{flex:1;}
+.btn-debug{font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;background:transparent;border:1px solid var(--border-light);color:var(--text-dim);padding:5px 14px;cursor:pointer;transition:all 0.15s;}
+.btn-debug:hover,.btn-debug.active{border-color:var(--cyan);color:var(--cyan);background:var(--cyan-dim);}
+.btn-back{font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;background:transparent;border:1px solid var(--border);color:var(--text-dim);padding:5px 14px;cursor:pointer;}
+.btn-back:hover{border-color:var(--border-light);color:var(--text);}
+.verdict-badge{padding:5px 16px;font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;}
+.verdict-PASS{background:var(--green-dim);color:var(--green);border:1px solid rgba(61,184,122,0.3);}
+.verdict-REVIEW{background:var(--accent-dim);color:var(--accent);border:1px solid var(--accent-border);}
+.verdict-FAIL{background:var(--red-dim);color:var(--red);border:1px solid rgba(232,85,85,0.3);}
+.report-panels{display:grid;grid-template-columns:1fr 1fr;height:calc(100vh - 105px);overflow:hidden;}
+.panel{overflow-y:auto;padding:24px;border-right:1px solid var(--border);}
+.panel:last-child{border-right:none;}
+/* Mobile report layout — the fixed-height two-pane-with-independent-scroll
+   design (summary panel + raw JSON side by side) is a desktop pattern that
+   actively fights a phone: it squeezes the whole report into a half-width
+   column, permanently shows the raw JSON dump nobody needs on a phone, and
+   nests nested-scroll regions inside an already-scrollable page, which is
+   awkward on touch. Below the breakpoint, collapse to one column and let the
+   page scroll naturally instead of clipping content into a fixed viewport
+   height. The header's toggle buttons also need to wrap instead of running
+   off-screen — on a narrow phone they were unreachable without first
+   discovering the header itself scrolls horizontally. */
+@media(max-width:820px){
+  #page-report .report-header{flex-wrap:wrap;row-gap:8px;padding:12px 16px;}
+  .hdr-sep{flex-basis:100%;height:0;}
+  .report-panels{grid-template-columns:1fr;height:auto;overflow:visible;}
+  .panel{border-right:none;border-bottom:1px solid var(--border);overflow-y:visible;padding:16px;}
+  .panel:last-child{border-bottom:none;}
+  /* Provider comparison cards (Document Analysis panel) — force to one
+     column instead of the desktop 1fr 1fr side-by-side layout. */
+  .provider-compare-grid{grid-template-columns:1fr !important;}
+  /* Field-by-Field Comparison table: instead of horizontal scroll on a
+     4-column table, stack each row into a labeled card. Headers are
+     hidden and each <td> grows a label from its data-label attribute. */
+  .doc-compare-table thead{display:none;}
+  .doc-compare-table, .doc-compare-table tbody, .doc-compare-table tr, .doc-compare-table td{display:block;width:100%;}
+  .doc-compare-table tr{border-bottom:1px solid var(--border-light);padding:8px 0;margin-bottom:4px;}
+  .doc-compare-table tr:last-child{border-bottom:none;}
+  .doc-compare-table td{padding:3px 0;border-bottom:none;}
+  .doc-compare-table td::before{content:attr(data-label);display:block;font-family:var(--mono);font-size:9px;letter-spacing:0.06em;text-transform:uppercase;color:var(--text-dim);margin-bottom:2px;}
+  .doc-compare-table td[data-label="Field"]{font-size:12px;color:var(--text-bright);font-weight:600;}
+  .doc-compare-table td[data-label="Field"]::before{content:none;}
+  /* The four toggle panels (Signal Analysis / Debug Trace / Image Review /
+     Document Analysis — includes the AAMVA barcode fields) each had a fixed
+     desktop max-height with their own internal overflow-y:auto scrollbar.
+     On mobile that's a scroll-within-a-scroll: opening Document Analysis
+     dropped content into a cramped ~560px box, easy to miss the rest of
+     unless you noticed it needed its own separate scroll gesture. Let them
+     expand to full content height and ride the normal page scroll instead. */
+  #signal-panel, #debug-panel, #image-panel, #doc-panel{max-height:none;overflow-y:visible;padding:16px;}
+}
+.panel-label{font-family:var(--mono);font-size:9px;letter-spacing:0.14em;text-transform:uppercase;color:var(--text-dim);margin-bottom:16px;padding-bottom:8px;border-bottom:1px solid var(--border);}
+.score-wrap{display:flex;align-items:center;gap:20px;margin-bottom:20px;padding:16px;background:var(--surface2);border:1px solid var(--border);}
+.score-num{font-family:var(--mono);font-size:38px;font-weight:700;line-height:1;}
+.score-meta .sk{font-family:var(--mono);font-size:9px;color:var(--text-dim);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:4px;}
+.score-meta .sv{font-size:11px;color:var(--text-dim);}
+.section-head{font-family:var(--mono);font-size:9px;color:var(--text-dim);letter-spacing:0.12em;text-transform:uppercase;margin:18px 0 8px;padding-bottom:4px;border-bottom:1px solid var(--border);}
+/* Groups sections under which of the 3 flow steps actually measured them
+   (Application / ID Capture / Liveness Scan) -- a heavier, differently-
+   colored banner than .section-head so it reads as a group boundary, not
+   just another subsection. */
+.step-group-head{font-family:var(--mono);font-size:11px;font-weight:700;color:var(--accent);letter-spacing:0.1em;text-transform:uppercase;margin:32px 0 4px;padding:8px 12px;background:var(--accent-dim);border-left:3px solid var(--accent);}
+.step-group-head:first-of-type{margin-top:24px;}
+.anomaly-card{border-left:3px solid var(--accent);background:var(--accent-dim);padding:10px 14px;margin-bottom:8px;}
+.anomaly-card.sev-high{border-color:var(--red);background:var(--red-dim);}
+.anomaly-card.sev-info{border-color:var(--cyan);background:var(--cyan-dim);}
+.anomaly-card.sev-pass{border-color:var(--green);background:var(--green-dim);}
+.anomaly-label{font-family:var(--mono);font-size:10px;font-weight:700;color:var(--accent);letter-spacing:0.06em;text-transform:uppercase;margin-bottom:3px;}
+.anomaly-card.sev-high .anomaly-label{color:var(--red);}
+.anomaly-card.sev-info .anomaly-label{color:var(--cyan);}
+.anomaly-card.sev-pass .anomaly-label{color:var(--green);}
+.anomaly-desc{font-size:12px;color:var(--text);line-height:1.5;}
+.anomaly-val{font-family:var(--mono);font-size:11px;color:var(--text-dim);margin-top:4px;}
+/* Location Consistency (GPS vs IP anti-spoofing map) */
+#location-map{height:280px;width:100%;background:var(--surface2);border:1px solid var(--border);}
+#location-map-placeholder{height:280px;width:100%;background:
+    repeating-linear-gradient(45deg, var(--surface2), var(--surface2) 10px, var(--surface) 10px, var(--surface) 20px);
+  border:1px dashed var(--border-light);display:flex;align-items:center;justify-content:center;text-align:center;padding:24px;}
+#location-map-placeholder .placeholder-text{font-family:var(--mono);font-size:11px;color:var(--text-dim);max-width:420px;line-height:1.6;}
+.location-legend{display:flex;gap:18px;margin-top:8px;font-family:var(--mono);font-size:10px;color:var(--text-dim);}
+.location-legend-item{display:flex;align-items:center;gap:6px;}
+.location-legend-dot{width:9px;height:9px;border-radius:50%;display:inline-block;}
+.location-legend-dot.gps{background:var(--cyan);}
+.location-legend-dot.ip{background:var(--accent);}
+/* Signal panel */
+#signal-panel{display:none;background:var(--bg);border-top:1px solid var(--border);padding:20px 28px 24px;max-height:380px;overflow-y:auto;}
+#signal-panel.open{display:block;}
+.signal-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px;}
+.sg{background:var(--surface);border:1px solid var(--border);padding:12px 14px;}
+.sg-head{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:7px;}
+.sg-lbl{font-family:var(--mono);font-size:9px;letter-spacing:0.07em;text-transform:uppercase;color:var(--text-dim);}
+.sg-val{font-family:var(--mono);font-size:15px;font-weight:700;}
+.sg-unit{font-family:var(--mono);font-size:9px;color:var(--text-dim);margin-left:2px;}
+.sg-bar-wrap{position:relative;height:5px;background:var(--surface2);margin-bottom:5px;}
+.sg-band{position:absolute;height:100%;background:rgba(77,184,200,0.2);border-left:1px solid var(--cyan);border-right:1px solid var(--cyan);}
+.sg-marker{position:absolute;width:2px;height:12px;top:-3.5px;transform:translateX(-50%);border-radius:1px;transition:left 0.4s;}
+.sg-marker.normal{background:var(--green);}
+.sg-marker.warning{background:var(--accent);}
+.sg-marker.danger{background:var(--red);}
+.sg-marker.unknown{background:var(--text-dim);}
+.sg-range{display:flex;justify-content:space-between;font-family:var(--mono);font-size:8px;color:var(--text-dim);}
+.sg-status{font-family:var(--mono);font-size:9px;letter-spacing:0.05em;text-transform:uppercase;margin-top:5px;}
+.sg-status.normal{color:var(--green);}.sg-status.warning{color:var(--accent);}.sg-status.danger{color:var(--red);}.sg-status.unknown{color:var(--text-dim);}
+.sg-src{font-size:9px;color:var(--text-dim);opacity:0.5;margin-top:2px;font-style:italic;}
+/* JSON */
+.json-view{font-family:var(--mono);font-size:11.5px;line-height:1.6;white-space:pre-wrap;word-break:break-all;color:var(--text-dim);}
+.json-key{color:var(--cyan);}.json-str{color:#8ED08E;}.json-num{color:#D4A0E0;}.json-bool{color:var(--accent);}.json-null{color:var(--text-dim);}
+/* Debug */
+#debug-panel{display:none;background:var(--bg);border-top:1px solid var(--border);padding:14px 28px;max-height:220px;overflow-y:auto;}
+#debug-panel.open{display:block;}
+.debug-label{font-family:var(--mono);font-size:9px;letter-spacing:0.14em;text-transform:uppercase;color:var(--cyan);margin-bottom:8px;}
+.et-row{display:flex;gap:10px;font-family:var(--mono);font-size:11px;line-height:1.7;}
+.et-ts{color:var(--text-dim);min-width:72px;}.et-type{color:var(--cyan);min-width:100px;}.et-detail{color:var(--text);}
+/* Image Review */
+#image-panel{display:none;background:var(--bg);border-top:1px solid var(--border);padding:20px 28px 24px;max-height:520px;overflow-y:auto;}
+#image-panel.open{display:block;}
+.image-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;}
+@media(max-width:900px){.image-grid{grid-template-columns:1fr;}}
+.image-slot{background:var(--surface);border:1px solid var(--border);padding:10px;}
+.image-slot-label{font-family:var(--mono);font-size:9px;letter-spacing:0.1em;text-transform:uppercase;color:var(--text-dim);margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;}
+.image-slot-badge{font-family:var(--mono);font-size:8px;padding:2px 6px;border:1px solid var(--border-light);}
+.image-slot-badge.present{color:var(--green);border-color:rgba(61,184,122,0.3);background:var(--green-dim);}
+.image-slot-badge.missing{color:var(--red);border-color:rgba(232,85,85,0.3);background:var(--red-dim);}
+.image-slot img{width:100%;height:220px;object-fit:contain;background:#000;display:block;}
+.image-slot-empty{width:100%;height:220px;display:flex;align-items:center;justify-content:center;color:var(--text-dim);font-family:var(--mono);font-size:11px;background:var(--surface2);text-align:center;padding:0 12px;}
+/* v67.12: an inline <video> in the ID Capture image grid was triggering
+   iOS Safari's native fullscreen video player on tap, with no way back to
+   this report (same bug Erik hit on the standalone capture page -- see
+   safe_idv_capture_passport_v70.html for the original diagnosis).
+   Replaced with a clickable poster thumbnail (styled/sized like the other
+   image slots) plus a bounded, page-owned modal (#videoModal below) that
+   opens on tap and has its own Close button. */
+.video-thumb{position:relative;width:100%;height:220px;background:#000;overflow:hidden;}
+.video-thumb img{width:100%;height:100%;object-fit:contain;display:block;}
+.video-play-button{position:absolute;inset:0;width:100%;height:100%;border:0;background:rgba(0,0,0,0.08);color:#fff;
+  font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;}
+.video-play-button span{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:10px 13px;
+  background:rgba(0,0,0,.72);border:1px solid rgba(255,255,255,.55);border-radius:4px;}
+.video-play-button:hover,.video-play-button:focus{background:rgba(0,0,0,.26);outline:2px solid var(--accent);outline-offset:-3px;}
+#videoModal{position:fixed;inset:0;z-index:40;background:rgba(0,0,0,0.94);display:none;
+  align-items:center;justify-content:center;flex-direction:column;padding:20px;}
+/* v67.13: the native `controls` bar on #videoModalPlayer had its own
+   fullscreen-expand icon -- tapping THAT (not the poster thumbnail) sent
+   the video into iOS Safari's OS-level fullscreen player, orphaning the
+   Close button below exactly the same way the original bug did. Fix: no
+   native `controls` at all, so there's no fullscreen icon to tap -- just
+   a small custom play/pause toggle overlaid on the video (see
+   toggleVideoModalPlayback()) and the existing page-owned Close button. */
+.video-modal-wrap{position:relative;max-width:100%;line-height:0;}
+#videoModal video{max-width:100%;max-height:72vh;background:#000;display:block;}
+.video-modal-toggle{position:absolute;left:10px;bottom:10px;width:38px;height:38px;border-radius:50%;
+  background:rgba(0,0,0,0.6);border:1px solid rgba(255,255,255,0.5);color:#fff;font-size:14px;
+  display:flex;align-items:center;justify-content:center;cursor:pointer;user-select:none;}
+#videoModal button{margin-top:16px;background:var(--accent);color:#000;border:none;padding:12px 24px;
+  font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;cursor:pointer;}
+.video-modal-status{min-height:18px;max-width:680px;margin-top:12px;color:var(--text-dim);font-family:var(--mono);font-size:10px;line-height:1.4;text-align:center;}
+/* Document Analysis */
+#doc-panel{display:none;background:var(--bg);border-top:1px solid var(--border);padding:20px 28px 24px;max-height:560px;overflow-y:auto;}
+#doc-panel.open{display:block;}
+.doc-compare-table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px;margin-top:4px;}
+.doc-compare-table th{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border-light);color:var(--text-dim);font-size:9px;letter-spacing:0.06em;text-transform:uppercase;white-space:nowrap;}
+.doc-compare-table td{padding:7px 10px;border-bottom:1px solid var(--border);color:var(--text-bright);vertical-align:top;}
+.doc-compare-table tr:hover td{background:var(--surface2);}
+.doc-match-badge{display:block;font-family:var(--mono);font-size:8px;letter-spacing:0.06em;text-transform:uppercase;margin-top:2px;}
+/* Scrollbar */
+::-webkit-scrollbar{width:5px;height:5px;}::-webkit-scrollbar-track{background:transparent;}::-webkit-scrollbar-thumb{background:var(--border-light);}
+
+/* ── PRINT / "DOWNLOAD PDF" ──
+   The report is meant to be saved as a reference document, not just viewed
+   on a dark screen. Overriding the theme's CSS custom properties at :root
+   flips every component (cards, tables, gauges) to a light, ink-friendly
+   palette for print without touching a single component rule -- everything
+   in this file already reads its colors from these variables. .no-print
+   hides interactive chrome (nav buttons, the Download PDF button itself)
+   that has no place in the saved document. */
+@media print {
+  :root {
+    --bg:#ffffff; --surface:#f4f4f4; --surface2:#ececec;
+    --border:#cccccc; --border-light:#aaaaaa;
+    --text:#222222; --text-dim:#555555; --text-bright:#000000;
+    --accent:#8a6400; --accent-dim:#fdf1d6; --accent-border:#8a6400;
+    --cyan:#006080; --cyan-dim:#e2f2f7;
+    --green:#146c34; --green-dim:#e5f5ea;
+    --red:#a11f18; --red-dim:#fbe9e8;
+  }
+  #app-header, .no-print { display: none !important; }
+  #page-report .report-header { border-bottom: 2px solid #000; }
+  .anomaly-card, .sg, .image-slot { break-inside: avoid; }
+  .section-head { break-after: avoid; margin-top: 14px; }
+}
+</style>
+</head>
+<body>
+
+<header id="app-header">
+  <div style="display:flex;align-items:center;gap:10px;">
+    <div class="logo-square">SF</div>
+    <div><div class="logo-text">SAFE</div><div class="logo-sub">Identity Verification</div></div>
+  </div>
+  <div class="hdr-sep"></div>
+  <div class="hdr-badge" id="session-badge">SESSION INIT</div>
+  <div class="hdr-badge" id="ts-badge">--:--:--</div>
+</header>
+<!-- ══ PAGE: REPORT ══
+     Client-facing build: this is now a single, always-expanded telemetry
+     report -- every section below is visible at once (no toggle buttons,
+     no hidden panels) so it reads as one continuous document on screen AND
+     prints/saves as a complete PDF in one shot. Deliberately shows NO
+     overall verdict/pass-fail badge anywhere -- per-item results (a
+     challenge passing, a field matching) are individual measurements, not
+     an application-level diagnosis. See renderClientReport() below. -->
+<div id="processing-overlay" style="display:none;"></div>
+
+<!-- ══ PAGE: CONFIRMATION (v67) ══
+     Shown BEFORE the full report, matching what the real product will
+     actually show an applicant: a simple submitted/failed confirmation, not
+     the internal technical report below (that's a reviewer/internal view).
+     Three sub-states toggled via renderConfirmation(): submitting (default),
+     success, error. On error, there is deliberately NO way to reach
+     #page-report from here — see attemptSubmission()'s comment — only Try
+     Again (retries the same in-memory submission) or Start Over. -->
+<div id="page-confirmation" class="page active">
+  <div class="confirm-wrap">
+    <div id="confirm-submitting">
+      <div class="processing-spinner-standalone"></div>
+      <div class="confirm-title">Submitting…</div>
+      <div class="confirm-body">This can take up to a minute.</div>
+    </div>
+    <div id="confirm-success" style="display:none;">
+      <div class="confirm-icon confirm-icon-success">✓</div>
+      <div class="confirm-title">Identity Verification Submitted</div>
+      <div class="confirm-body">Your submission has been received and is being reviewed. You’ll be notified once a decision has been made.</div>
+      <button class="btn-primary" onclick="viewDetailedReport()">View Detailed Report →</button>
+      <div class="confirm-body" id="confirm-view-report-error" style="display:none;color:#e5484d;margin-top:10px;"></div>
+      <!-- v70: permanent link to this session's report, saved server-side so
+           it survives after this tab/sessionStorage is gone -- see
+           saveReportCopy(). Hidden until the save actually succeeds; a
+           failed/unreachable save (e.g. server not yet updated with the
+           /api/v1/reports endpoint) silently leaves this hidden rather than
+           blocking or alarming about anything -- the submission above this
+           already succeeded regardless. -->
+      <div id="confirm-saved-report" style="display:none;margin-top:14px;">
+        <a class="btn-secondary" id="confirm-saved-report-link" href="#" target="_blank" rel="noopener" style="display:inline-block;text-decoration:none;">🔗 Permanent Report Link</a>
+      </div>
+      <div class="confirm-demo-note">Demo note: applicants would not normally see the report below — it’s the internal/reviewer view, included here so this one flow can demonstrate both.</div>
+    </div>
+    <div id="confirm-error" style="display:none;">
+      <div class="confirm-icon confirm-icon-error">⚠</div>
+      <div class="confirm-title" id="confirm-error-title">Submission Couldn’t Be Completed</div>
+      <div class="confirm-body" id="confirm-error-body">—</div>
+      <button class="btn-primary" id="confirm-retry-btn" onclick="attemptSubmission()">Try Again</button>
+      <div class="confirm-startover"><a href="safe_idv_setup_v70.html">Start over from the beginning</a></div>
+    </div>
+  </div>
+</div>
+
+<div id="page-report" class="page">
+  <div class="report-header">
+    <div>
+      <!-- v67.15: was "Session Telemetry Report" -- Erik asked for this to
+           read as an IDV report rather than a generic telemetry dump. -->
+      <div class="report-title">Session IDV Report</div>
+      <div class="report-subject" id="rpt-subject">—</div>
+    </div>
+    <div class="hdr-sep"></div>
+    <button class="btn-debug no-print" onclick="window.print()">⤓ Download PDF</button>
+    <!-- v67 internal testing build only: raw backend response, redacted of
+         image data. window.print()/Download PDF is unreliable on iOS Safari
+         (relies on the OS print sheet, which doesn't consistently work in
+         every mobile context), and there is otherwise no way to get the raw
+         decodeStatus/decodeNotes/analysisMessage/visionProviders detail off
+         THIS screen once a session has already been submitted -- the
+         capture step's own Debug panel only exists during a live capture,
+         not after landing here. Long-press -> Select All -> Copy on the
+         <pre> below works reliably on iOS Safari without needing the
+         Clipboard API or a print dialog at all. -->
+    <button class="btn-debug no-print" onclick="document.getElementById('rpt-raw-debug').classList.toggle('open')">{ } Raw Response</button>
+    <button id="rpt-copy-all-btn" class="btn-debug no-print" onclick="copyDebugPanel('rpt-raw-debug','rpt-copy-all-btn')">⧉ Copy All</button>
+    <!-- v67.15: separate, narrower toggle -- see the comment on
+         document.getElementById('rpt-vendor-payload').textContent = ...
+         in renderClientReport() for why this is deliberately not the same
+         data as Raw Response above. -->
+    <button class="btn-debug no-print" onclick="document.getElementById('rpt-vendor-payload').classList.toggle('open')">{ } Request Payload</button>
+    <button id="rpt-copy-payload-btn" class="btn-debug no-print" onclick="copyDebugPanel('rpt-vendor-payload','rpt-copy-payload-btn')">⧉ Copy All</button>
+    <button class="btn-back no-print" onclick="restartSession()">← New Session</button>
+    <!-- v70: deletes the saved copy of THIS report from the server (see
+         deleteThisReport() below). Works whether this page is the live,
+         just-submitted view or a saved /reports/{sessionId}.html file
+         reopened later -- deleteThisReport() figures out which session id
+         actually applies in each case, since the embedded SESSION_ID
+         constant re-randomizes every time this script re-runs and is only
+         trustworthy on the very first, original page load. -->
+    <button id="rpt-delete-btn" class="btn-debug no-print" style="color:var(--red);border-color:rgba(232,85,85,0.4);" onclick="deleteThisReport()">🗑 Delete Report</button>
+  </div>
+  <div id="rpt-delete-status" class="no-print" style="display:none;padding:10px 20px;font-family:var(--mono);font-size:11px;"></div>
+  <div style="max-width:880px;margin:0 auto;padding:28px 24px 56px;">
+    <pre id="rpt-raw-debug" class="no-print" style="display:none;background:var(--bg);border:1px solid var(--border-light);padding:14px;margin-bottom:16px;max-height:400px;overflow:auto;font-family:var(--mono);font-size:10px;line-height:1.5;white-space:pre-wrap;word-break:break-word;"></pre>
+    <pre id="rpt-vendor-payload" class="no-print" style="display:none;background:var(--bg);border:1px solid var(--border-light);padding:14px;margin-bottom:16px;max-height:400px;overflow:auto;font-family:var(--mono);font-size:10px;line-height:1.5;white-space:pre-wrap;word-break:break-word;"></pre>
+    <style>#rpt-raw-debug.open, #rpt-vendor-payload.open{display:block !important;}</style>
+    <div id="rpt-mock-banner" class="anomaly-card sev-info" style="display:none;animation:none;margin-bottom:16px;">
+      <div class="anomaly-label">Representative Sample Data — Mock Session</div>
+      <div class="anomaly-desc">This session ran in Mock Mode (required API keys for data analysis not provided or not activated). Everything below reflects what SAFE actually measured during this session, except the Document Data and Face Match sections, marked "sample" — those specific values are representative samples so you can see the type of data a live session returns.</div>
+    </div>
+
+    <div class="section-head">Session Overview</div>
+    <div id="rpt-meta-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px;"></div>
+
+    <!-- ══ STEP: APPLICATION ══ -->
+    <div class="step-group-head">Step 1 — Application</div>
+    <div class="section-head">Application Telemetry</div>
+    <div id="rpt-application-telemetry" style="margin-bottom:8px;"></div>
+
+    <!-- ══ STEP: ID CAPTURE ══ -->
+    <div class="step-group-head">Step 2 — ID Capture</div>
+    <div class="section-head">Document Data</div>
+    <div id="rpt-document-data" style="margin-bottom:8px;"></div>
+
+    <div class="section-head">Capture Integrity Signals</div>
+    <div class="signal-grid" id="capture-integrity-grid" style="margin-bottom:8px;"></div>
+
+    <div class="section-head">ID Images</div>
+    <div class="image-grid" id="id-capture-image-grid" style="margin-bottom:8px;"></div>
+
+    <!-- ══ STEP: LIVENESS SCAN ══ -->
+    <div class="step-group-head">Step 3 — Liveness Scan</div>
+    <div class="section-head">Liveness Challenges</div>
+    <div id="rpt-challenges" style="margin-bottom:8px;"></div>
+
+    <div class="section-head">Signal Analysis</div>
+    <div class="signal-grid" id="signal-grid" style="margin-bottom:8px;"></div>
+
+    <div class="section-head">Device &amp; Environment</div>
+    <div id="rpt-device" style="margin-bottom:8px;"></div>
+
+    <div class="section-head">Location Consistency (GPS vs. Network)</div>
+    <div id="rpt-location-summary" style="margin-bottom:10px;"></div>
+    <div id="rpt-location-map-wrap" style="margin-bottom:8px;"></div>
+
+    <div class="section-head">Motion / Optical Correlation</div>
+    <div id="rpt-imu" style="margin-bottom:8px;"></div>
+
+    <div class="section-head">Liveness Signal Findings</div>
+    <div id="rpt-anomalies" style="margin-bottom:8px;"></div>
+
+    <div class="section-head">Face Match</div>
+    <div id="rpt-facematch-data" style="margin-bottom:8px;"></div>
+
+    <div class="section-head">Selfie Image</div>
+    <div class="image-grid" id="liveness-selfie-grid" style="margin-bottom:8px;"></div>
+
+    <div class="no-print" style="text-align:center;margin-top:32px;">
+      <button class="btn-primary" onclick="window.print()" style="margin-right:10px;">⤓ Download PDF</button>
+      <button class="btn-back" onclick="restartSession()">← New Session</button>
+    </div>
+  </div>
+</div>
+<!-- v67.12: bounded, page-owned video player -- opened on demand from a
+     poster thumbnail in the ID Capture image grid (see openVideoModal()/
+     closeVideoModal() below), never an inline autoplaying <video> in the
+     grid itself, so it can't trigger iOS's native fullscreen takeover.
+     v67.13: no `controls` attribute either now -- see the CSS comment
+     above #videoModal for why (its native fullscreen icon was the actual
+     escape hatch). toggleVideoModalPlayback() drives the custom overlay
+     button instead. -->
+<div id="videoModal" class="no-print">
+  <div class="video-modal-wrap">
+    <video id="videoModalPlayer" playsinline webkit-playsinline="true" disablePictureInPicture onclick="toggleVideoModalPlayback()"></video>
+    <div class="video-modal-toggle" id="videoModalToggle" onclick="toggleVideoModalPlayback()">⏸</div>
+  </div>
+  <div id="videoModalStatus" class="video-modal-status" aria-live="polite"></div>
+  <button onclick="closeVideoModal()">Close</button>
+</div>
+<script>
+// ══════════════════════════════════════════════════════
+// GLOBALS
+// ══════════════════════════════════════════════════════
+const T0 = Date.now();
+const SESSION_ID = Math.random().toString(36).slice(2,10).toUpperCase();
+const eventLog = [];
+
+function logEvt(type, detail) {
+  eventLog.push({ts: +(((Date.now()-T0)/1000).toFixed(3)), type, detail: detail||null});
+}
+
+// v67: real implementation again. This page briefly went single-page-only
+// (page-report always active, this was a no-op) during the v63 reorder,
+// since back then renderClientReport() was the only screen this file ever
+// showed. Restored to a real page-switcher now that a second screen exists
+// — see #page-confirmation below, which shows BEFORE #page-report so the
+// applicant sees a simple success/error confirmation first, matching what
+// the real product will show (the full technical report is an internal/
+// reviewer view, reached here via the confirmation screen's own button
+// rather than being the landing page).
+function showPage(id) {
+  document.querySelectorAll('.page').forEach(el => el.classList.remove('active'));
+  const target = document.getElementById(id);
+  if (target) target.classList.add('active');
+  // v67: swapping which page is display:block happens silently -- no
+  // animation, no scroll movement of its own. If the viewport was already
+  // near the top (e.g. tapping "View Detailed Report" from a short
+  // confirmation screen that hadn't been scrolled), an instant scrollTo(0,0)
+  // is a no-op the user can't perceive, so the click LOOKS like it did
+  // nothing even though the report loaded correctly underneath -- the
+  // report itself was always reachable by scrolling down manually. A smooth
+  // scroll gives visible motion so the transition actually registers.
+  if (target) {
+    target.scrollIntoView({behavior: 'smooth', block: 'start'});
+  } else {
+    window.scrollTo({top: 0, behavior: 'smooth'});
+  }
+}
+// ══════════════════════════════════════════════════════
+// IDV ENGINE INTEGRATION CONFIG
+// ══════════════════════════════════════════════════════
+// The host application (the real applicant-facing intake flow this file is
+// embedded in) should set window.SAFE_IDV_CONFIG BEFORE this <script> tag runs, e.g.:
+//   <script>
+//     window.SAFE_IDV_CONFIG = {
+//       apiBase: 'https://idv.internal.amsa.example/api/v1',
+//       apiKey:  'safe_xxx...',                 // issued in Maurice's admin UI
+//       applicant: { firstName:'...', lastName:'...', dateOfBirth:'...', documentNumber:'...' },
+//       documentImages: { frontImage: 'data:image/jpeg;base64,...', backImage: 'data:image/jpeg;base64,...' }
+//     };
+//   <\/script>
+// documentImages MUST come from the applicant's already-captured ID document step
+// elsewhere in the flow — SAFE Capture only ever supplies the selfie, and only the
+// frame it locked itself. There is intentionally no UI path here for an applicant
+// to upload or choose their own selfie image.
+//
+// NOTE for Maurice: the engine as shipped has no CORS configuration (no
+// @CrossOrigin / CorsConfigurationSource bean found in the jar). If this page is
+// served from a different origin than the Java service, add a CORS mapping scoped
+// to /api/** allowing this origin, or front the service with a same-origin reverse
+// proxy. Without one of those, the fetch() call below will fail in-browser even
+// though curl/Postman work fine against the same endpoint.
+// NOTE: apiBase and apiKey both default to values that make the dev harness
+// work out of the box against THIS demo's own local server, rather than
+// empty/localhost values that have twice now been silently lost across file
+// copies during packaging (see git history / past regressions). Put any
+// future fix to these defaults directly in this object literal — not in an
+// HTML attribute elsewhere on the page — so it can't be lost that way again.
+//   - apiBase derives from location.origin so it automatically follows this
+//     page wherever it's served from (localhost, LAN IP, or an ngrok HTTPS
+//     tunnel) instead of hardcoding a port that's only reachable on the Mac
+//     itself.
+//   - apiKey defaults to a non-secret placeholder. mock_server.py does not
+//     validate this Bearer value at all (it's Maurice's real engine that
+//     would); its only purpose here is to keep this from being falsy, which
+//     would make callIdvEngine() skip the call entirely (see the
+//     `if (!cfg.apiKey)` short-circuit below) and silently never reach the
+//     mock/live server no matter what keys are configured there.
+const IDV_CONFIG = Object.assign({
+  enabled: true,
+  apiBase: (typeof location !== 'undefined' && location.origin && location.origin !== 'null'
+    ? location.origin : 'http://localhost:8080') + '/api/v1',
+  // 60s, not the more typical few-second API timeout: live mode makes TWO
+  // sequential real vision-model calls per provider (OCR extraction, then
+  // face-match), and face-match alone (two full images in one request) can
+  // routinely take 10-30s. This value was bumped once before for exactly
+  // this reason and was lost across a file-copy rebuild — see README for
+  // why it matters; do not shrink this back down without re-reading that.
+  timeoutMs: 60000,
+  applicant: null,
+  documentImages: null,
+  captureSignals: null,
+}, (window.SAFE_IDV_CONFIG || {}));
+// ── IndexedDB helper for the intake→capture image handoff ───────────────
+// Read-side counterpart of the same helper in safe_intake_v6.html — see
+// that file's comment for the full root-cause writeup (removing the back-
+// image resize cap to fix PDF417 decode made a full-res photo blow through
+// sessionStorage's quota, so the image payload moved to IndexedDB instead).
+const SAFE_IDB_NAME = 'safe_idv_client_handoff_db';
+const SAFE_IDB_STORE = 'images';
+const SAFE_IDB_KEY = 'documentImages_v1';
+const SAFE_IDB_SELFIE_KEY = 'selfieImage_v1'; // v67 reorder: locked liveness selfie, same handoff mechanism as documentImages
+
+function safeIdbOpen() {
+  return new Promise((resolve, reject) => {
+    if (!('indexedDB' in window)) { reject(new Error('IndexedDB not available')); return; }
+    const req = indexedDB.open(SAFE_IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(SAFE_IDB_STORE)) {
+        req.result.createObjectStore(SAFE_IDB_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('IndexedDB open failed'));
+  });
+}
+
+async function safeIdbGet(key) {
+  const db = await safeIdbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(SAFE_IDB_STORE, 'readonly');
+    const getReq = tx.objectStore(SAFE_IDB_STORE).get(key);
+    getReq.onsuccess = () => { db.close(); resolve(getReq.result); };
+    getReq.onerror = () => { db.close(); reject(getReq.error); };
+  });
+}
+
+async function safeIdbDelete(key) {
+  try {
+    const db = await safeIdbOpen();
+    await new Promise((resolve) => {
+      const tx = db.transaction(SAFE_IDB_STORE, 'readwrite');
+      tx.objectStore(SAFE_IDB_STORE).delete(key);
+      tx.oncomplete = () => { db.close(); resolve(); };
+      tx.onerror = () => { db.close(); resolve(); };
+    });
+  } catch (e) { /* best-effort cleanup only */ }
+}
+
+// IndexedDB preserves MediaRecorder output as Blob objects for the live
+// handoff. Blob URLs are intentionally temporary, however: a `blob:` URL is
+// meaningful only in the browser page that created it. Convert each report-
+// only video to a data URL before rendering/saving a durable report so the
+// generated /reports/{sessionId}.html page remains independently playable.
+const REPORT_VIDEO_FIELDS = ['openingGestureVideo', 'tiltGestureVideo', 'flipVideo'];
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('Could not read captured video.'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function prepareReportVideoEvidence() {
+  const images = IDV_CONFIG.documentImages;
+  if (!images || typeof images !== 'object') return;
+  for (const field of REPORT_VIDEO_FIELDS) {
+    const value = images[field];
+    if (!(value instanceof Blob)) continue;
+    try {
+      images[field] = await blobToDataUrl(value);
+      logEvt('report_video_serialized', {field, bytes: value.size, mimeType: value.type || 'unknown'});
+    } catch (e) {
+      // The live page can still use the original Blob. A report save will
+      // retain the still evidence and omit only this unavailable video rather
+      // than blocking the completed verification flow.
+      console.warn('Could not serialize report video', field, e.message);
+      logEvt('report_video_serialize_failed', {field, error: e.message});
+    }
+  }
+}
+// ── INTAKE HANDOFF (safe_intake_v6.html -> here) ────────────────────────
+// If this page was reached via the intake form's escalation flow (form
+// signal-integrity score below its auto-approval threshold), the intake
+// page wrote applicant fields + ID document images to sessionStorage before
+// navigating here. Same-origin only, cleared with the tab — never persisted
+// beyond this session. Falls back to whatever window.SAFE_IDV_CONFIG /
+// the dev harness already set if there's no handoff (e.g. this page was
+// opened directly for standalone testing).
+//
+// This is now async — the (normal-case) image payload lives in IndexedDB,
+// not embedded in the sessionStorage JSON, so retrieving it is asynchronous.
+// intakeHandoffPromise is awaited in runReportPipeline() below, before
+// IDV_CONFIG.documentImages is actually used, so this always resolves in
+// time (IndexedDB reads take milliseconds; the liveness capture loop that
+// runs first takes several seconds at minimum).
+let INTAKE_CONTEXT = null;
+const intakeHandoffPromise = (async function readIntakeHandoff() {
+  let raw;
+  try { raw = sessionStorage.getItem('SAFE_CLIENT_HANDOFF_V1'); } catch (e) { return; }
+  if (!raw) return;
+  let handoff;
+  try {
+    handoff = JSON.parse(raw);
+  } catch (e) {
+    console.warn('Malformed intake handoff data, ignoring:', e.message);
+    return;
+  } finally {
+    // One-shot: don't replay this handoff if the applicant reloads or a
+    // second session starts in the same tab.
+    try { sessionStorage.removeItem('SAFE_CLIENT_HANDOFF_V1'); } catch (e) {}
+  }
+
+  if (handoff.applicant) IDV_CONFIG.applicant = Object.assign({}, handoff.applicant, IDV_CONFIG.applicant);
+  INTAKE_CONTEXT = handoff.intakeContext || null;
+  // Document images normally live in IndexedDB (see the write side in
+  // safe_intake_v6.html). Falls back to reading them directly off the
+  // handoff object for the rare case IndexedDB wasn't available at write
+  // time (see the fallback there).
+  let images = handoff.documentImages || null;
+  if (!images) {
+    try {
+      images = await safeIdbGet(SAFE_IDB_KEY);
+      await safeIdbDelete(SAFE_IDB_KEY); // one-shot, same discipline as the sessionStorage key
+    } catch (e) {
+      console.warn('Could not read document images from IndexedDB:', e.message);
+    }
+  }
+  if (images) IDV_CONFIG.documentImages = Object.assign({}, images, IDV_CONFIG.documentImages);
+
+  // Silent capture-quality/spoof/device signal metadata from the autocapture
+  // component (see SAFE_Document_Autocapture_Spec.md). Absent on the Stock
+  // Images path — a plain file upload has none of this to report. Never
+  // rendered in this page's UI; only forwarded into the /cases POST body
+  // for backend-only evaluation, per the "never surface" behavioral rule.
+  if (handoff.captureSignals) IDV_CONFIG.captureSignals = handoff.captureSignals;
+  // v67.1: doc-type interview answer + MRZ parse result (passport path only,
+  // absent entirely on the DL path) -- see safe_idv_launch_v70.html and
+  // safe_idv_capture_passport_v70.html for where these originate.
+  if (handoff.docTypeSelection) IDV_CONFIG.docTypeSelection = handoff.docTypeSelection;
+  if (handoff.mrz) IDV_CONFIG.mrz = handoff.mrz;
+
+  // v67 reorder: the liveness/selfie step now runs BEFORE this page (see
+  // safe_idv_launch_v70.html), reporting its results via postMessage the
+  // same way document capture already does. Launch merges both into this
+  // same handoff object, so this page never runs its own camera/challenge
+  // flow at all -- it just reads what already happened. The locked selfie
+  // frame is a full photo like the document images, so it gets the same
+  // IndexedDB-first treatment (sessionStorage's quota is too small for it) --
+  // falls back to reading it directly off the handoff object for the rare
+  // case IndexedDB wasn't available at write time.
+  let selfieImage = handoff.selfieImage || null;
+  if (!selfieImage) {
+    try {
+      selfieImage = await safeIdbGet(SAFE_IDB_SELFIE_KEY);
+      await safeIdbDelete(SAFE_IDB_SELFIE_KEY); // one-shot, same discipline as documentImages
+    } catch (e) {
+      console.warn('Could not read selfie image from IndexedDB:', e.message);
+    }
+  }
+  if (selfieImage) IDV_CONFIG.selfieImage = selfieImage;
+  if (handoff.livenessSignals) IDV_CONFIG.livenessSignals = handoff.livenessSignals;
+
+  // Surface this in the dev harness panel. The <input type="file"> below
+  // can never show a filename here — browsers don't allow scripts to
+  // populate a file input's value, for obvious security reasons — so
+  // without an explicit note it looks like nothing was received even
+  // though IDV_CONFIG.documentImages is fully populated above.
+  const statusEl = document.getElementById('dev-idv-status');
+  if (statusEl && images) {
+    const hasFront = !!images.frontImage;
+    const hasBack = !!images.backImage;
+    statusEl.textContent = '✓ Received via intake handoff — Front: ' + (hasFront ? 'yes' : 'no')
+      + ' · Back: ' + (hasBack ? 'yes' : 'no')
+      + ' (file pickers below are empty by design — the browser won’t let a script pre-fill them — but the images are loaded)';
+    statusEl.style.color = 'var(--green)';
+  }
+})();
+// Clock
+setInterval(() => {
+  document.getElementById('ts-badge').textContent = new Date().toLocaleTimeString('en-US',{hour12:false});
+}, 1000);
+document.getElementById('session-badge').textContent = 'SES:' + SESSION_ID;
+async function callIdvEngine(selfieDataUrl) {
+  const cfg = IDV_CONFIG;
+  // Captured up front and attached to EVERY return path below (success,
+  // error, skipped, unavailable) so the report's image viewer always has
+  // a record of exactly what was — or would have been — sent, regardless
+  // of how the call itself turned out. This is the single source of truth
+  // for "did the document images actually make it into the request."
+  const sentImages = {
+    frontImage: cfg.documentImages?.frontImage || null,
+    backImage: cfg.documentImages?.backImage || null,
+    selfieImage: selfieDataUrl || null,
+    // Zoomed-in barcode-decode crop from autocapture's dedicated barcode
+    // step, when present (Stock Images uploads never have one). See
+    // live_analysis.py's run_live_analysis — it prefers this over backImage
+    // for the actual PDF417 decode, falling back to backImage if absent.
+    backBarcodeImage: cfg.documentImages?.backBarcodeImage || null,
+    // v68.15.2: passport-card-only MRZ closeup, from the capture file's
+    // dedicated MRZ step. Null on every other path.
+    backMrzImage: cfg.documentImages?.backMrzImage || null,
+    // v67.5: passport-only evidence shots -- see renderPassportCaptureImages().
+    closedCoverImage: cfg.documentImages?.closedCoverImage || null,
+    bothPagesImage: cfg.documentImages?.bothPagesImage || null,
+    // v68.15: DL-path tilt/OVI angle-response stills (3 frames: widest/mid/
+    // narrowest angle -- see grabTiltFrame()/selectTiltFrames() in
+    // safe_idv_capture_v70.html). Unlike the video below, these ARE
+    // meant for the live vision API call -- that file's own comment on
+    // grabTiltFrame() says exactly why: "Retain a few tilt frames so the
+    // BACKEND can verify angle response itself rather than trusting
+    // client-side metrics." Absent (null) on the passport path and on any
+    // DL session predating this field.
+    tiltFrameImages: cfg.documentImages?.tiltFrameImages || null,
+    // v67.11/v68.15: openingGestureVideo and tiltGestureVideo are
+    // DELIBERATELY NOT included here. Vision APIs (OpenAI/Anthropic, per
+    // live_analysis.py) take images, not video, so neither can ride in this
+    // same JSON+image request the way the stills do. Both stay report-
+    // page-only artifacts -- see renderPassportCaptureImages()/
+    // renderIdCaptureImages()/videoSlotHtml(), which read them straight
+    // from cfg.documentImages rather than from this object.
+  };
+
+  // Same "attached to every return path" discipline as sentImages above —
+  // the rationale panel needs this regardless of whether the IDV call
+  // itself succeeded, since it describes the CAPTURE, not the analysis.
+  const captureSignals = cfg.captureSignals || null;
+
+  // v67.15: the exact JSON body this function sends (or would send) to the
+  // IDV engine at cfg.apiBase -- built up front and attached to every
+  // return path below, same "always attached, regardless of outcome"
+  // discipline as sentImages/captureSignals above, so the Request Payload
+  // panel (see renderClientReport()) shows the dev team the real outbound
+  // shape even on a skipped/unavailable/failed call. This is deliberately
+  // NOT the same thing as the Raw Response panel: Raw Response is this
+  // report page's own internal data model (application/liveness/capture
+  // signals plus whatever came back in .data below); this is specifically
+  // what actually leaves the browser. Today cfg.apiBase is mock_server.py
+  // or live_analysis.py's GPT-4o Vision/Claude Vision passthrough, NOT
+  // IDScan or any other vendor -- if/when a real vendor integration
+  // replaces this endpoint, this shape (and this function) is exactly
+  // what would need to be reworked to match that vendor's actual request
+  // contract, not assumed to carry over as-is.
+  const body = {
+    applicant: cfg.applicant || {},
+    images: sentImages,
+    // v68.15.2: lets the backend pick which back-of-card barcode symbology
+    // to attempt (PDF417 for a DL/state-ID, Code 39 for a US passport
+    // card) -- see mock_server.py/live_analysis.py's decode_barcode().
+    // Harmless for every other doc type; the server only branches on it
+    // for 'passport_card'.
+    docType: cfg.docTypeSelection?.docType || null,
+  };
+  // Autocapture's silent capture-quality/spoof/device signals, forwarded
+  // untouched — never read or displayed anywhere in this page, purely
+  // pass-through cargo for backend-only evaluation. Omitted entirely on the
+  // Stock Images path (cfg.captureSignals stays null), so mock_server.py's
+  // handling of this field must treat it as optional.
+  if (cfg.captureSignals) body.captureSignals = cfg.captureSignals;
+
+  if (!cfg.enabled) {
+    logEvt('idv_skipped', {reason: 'disabled in config'});
+    return {status: 'skipped', reason: 'IDV engine integration is disabled in configuration.', sentImages, captureSignals, requestPayload: body};
+  }
+  if (!selfieDataUrl) {
+    logEvt('idv_skipped', {reason: 'no locked selfie frame'});
+    return {status: 'error', reason: 'No selfie frame was locked — cannot submit to IDV engine.', sentImages, captureSignals, requestPayload: body};
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
+  try {
+    logEvt('idv_call_start', {apiBase: cfg.apiBase, hasFront: !!sentImages.frontImage, hasBack: !!sentImages.backImage});
+    const res = await fetch(`${cfg.apiBase}/cases`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) {
+      let text = '';
+      try { text = await res.text(); } catch(_) {}
+      logEvt('idv_call_http_error', {status: res.status, body: text.slice(0,300)});
+      // category lets the confirmation screen (see attemptSubmission() /
+      // composeSubmissionErrorMessage() below) pick accurate, actionable
+      // copy without fragile string-matching on `reason` — an HTTP error
+      // means the request WORKED and the server responded, so it isn't a
+      // "check your connection" problem the way a timeout/network failure is.
+      return {status: 'error', category: 'http', reason: `IDV engine returned HTTP ${res.status}.`, httpStatus: res.status, sentImages, captureSignals, requestPayload: body};
+    }
+    const json = await res.json();
+    logEvt('idv_call_success', {caseId: json.caseId, caseNumber: json.caseNumber, faceMatch: json.faceMatch?.matchStatus});
+    return {status: 'ok', data: json, sentImages, captureSignals, requestPayload: body};
+  } catch(e) {
+    clearTimeout(timer);
+    const timedOut = e.name === 'AbortError';
+    const corsOrNetwork = !timedOut && (e.name === 'TypeError' || /Failed to fetch/i.test(e.message||''));
+    logEvt('idv_call_failed', {error: e.message, timedOut, corsOrNetwork});
+    return {
+      status: 'error',
+      category: timedOut ? 'timeout' : (corsOrNetwork ? 'network' : 'other'),
+      reason: timedOut
+        ? `IDV engine did not respond within ${cfg.timeoutMs/1000}s.`
+        : corsOrNetwork
+          ? 'Could not reach IDV engine. Check that it is running and reachable at the configured URL, and that it has CORS enabled for this page’s origin.'
+          : `IDV engine call failed: ${e.message}`,
+      sentImages,
+      captureSignals,
+      requestPayload: body,
+    };
+  }
+}
+
+const SEV_RANK = {PASS: 0, REVIEW: 1, FAIL: 2};
+function haversineDistanceKm(lat1, lon1, lat2, lon2) {
+  const toRad = d => d * Math.PI / 180;
+  const R = 6371; // Earth's mean radius in km
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+// ══════════════════════════════════════════════════════
+// CLIENT-FACING REPORT — replaces the internal build's renderReport().
+// This is deliberately NOT a pass/fail diagnosis screen. It's a
+// comprehensive, always-expanded telemetry report showing everything SAFE
+// measures across all three steps of the flow (Application, ID Capture,
+// Liveness) so a viewer can see the type and depth of signal being
+// collected. No overall verdict badge, no "Verified"/"Under Review"/
+// "Not Verified" language anywhere. Individual per-item results (a
+// challenge passing, a field matching the application) are shown as what
+// they are — one measurement each — never rolled up into an application-
+// level disposition. Reuses the same real underlying signal computation
+// (scoreSession, renderSignalGauges, renderCaptureIntegrityPanel,
+// renderImagePanel — genuine telemetry logic, unchanged) purely for the
+// values, discarding only the verdict labels those functions used to
+// justify. The old renderReport() and its verdict/compositing helpers are
+// left defined below but uncalled.
+// ══════════════════════════════════════════════════════
+
+// Representative sample data for the Document & Face Match section when no
+// real analysis ran (Mock Mode, or a live call that didn't complete) — the
+// backend intentionally returns empty ocrData/null faceMatch in that case
+// (see live_analysis.py) rather than fabricating a result, which is correct
+// for the backend but leaves this demo-facing report with nothing to show.
+// This fallback lives ONLY here on the display side, is always labeled via
+// rpt-mock-banner + isSample below, and never touches live_analysis.py or
+// mock_server.py — the actual analysis logic is completely unaffected.
+function buildMockSampleDocumentData(applicant) {
+  const a = applicant || {};
+  return {
+    ocrData: {
+      isDocumentDetected: true,
+      extractionConfidence: 94,
+      qualityNotes: 'Sample value — illustrates the OCR extraction confidence a live session reports.',
+      tamperNotes: null,
+    },
+    faceMatch: {
+      matchStatus: 'MATCH', matchConfidence: 97, falseAcceptanceRate: '1 in 50,000',
+      antiSpoofingConfidence: 98, isSuspiciousPhoto: false, isPhotoFromDocumentTampered: false,
+      assessedAgeFromSelfie: 29, assessedAgeFromDocument: 29,
+      isAgeCheckSuccess: true, isGenderCheckSuccess: true,
+      aiNotes: 'Sample value — illustrates the face-match assessment a live session reports.',
+    },
+    documentFlags: {
+      isDriversLicenseRealId: true, isDocumentExpired: false, isInvalidated: false,
+      isCommercialDriversLicense: false, isPermit: false, isNonDomicile: false,
+      documentConfidence: 96,
+    },
+    comparison: {
+      overallMatchScore: 98,
+      fields: [
+        {fieldName: 'FIRST NAME', applicationValue: a.firstName || 'JORDAN', ocrValue: a.firstName || 'JORDAN', matchStatus: 'MATCH'},
+        {fieldName: 'LAST NAME', applicationValue: a.lastName || 'ALVAREZ', ocrValue: a.lastName || 'ALVAREZ', matchStatus: 'MATCH'},
+        {fieldName: 'DATE OF BIRTH', applicationValue: a.dateOfBirth || '1994-03-11', ocrValue: a.dateOfBirth || '1994-03-11', matchStatus: 'MATCH'},
+        {fieldName: 'ADDRESS', applicationValue: a.addressLine1 || '412 Birchwood Ln', ocrValue: a.addressLine1 || '412 Birchwood Ln', matchStatus: 'MATCH'},
+      ],
+    },
+    barcodeData: {
+      decodeStatus: 'SAMPLE', decodeNotes: 'Sample value — illustrates the AAMVA/PDF417 barcode fields a live session reports.',
+      documentClass: 'D', restrictionCode: 'NONE', endorsementsCode: 'NONE',
+      isRealId: true, isVeteran: false, isDonor: true, isLimitedDurationDocument: false,
+      documentDiscriminator: 'SAMPLE0000123', inventoryControlNumber: 'SAMPLE-IC-001',
+      aamvaVersion: '10', jurisdictionVersion: '0', iin: '636000',
+    },
+  };
+}
+
+// Vendor-neutral: reads only the backend's top-level ocrData/faceMatch/
+// comparison/documentFlags/barcodeData (already normalized to one result
+// regardless of which analysis engine ran underneath — see
+// live_analysis.py's run_live_analysis() docstring). Never reads
+// payload.idv.data.visionProviders, the raw per-engine breakdown this
+// build never surfaces.
+// Shared detection: is there a REAL analysis result, or should the sample
+// fallback be used? Keyed off ocrData.isDocumentDetected specifically
+// (rather than "is ocrData non-empty") because the backend's own
+// no_analysis_result() (see mock_server.py/live_analysis.py — used for both
+// Mock Mode and a live call that failed outright) still returns an ocrData
+// object, just with every field explicitly null, including a qualityNotes
+// string that references API keys and "the dev harness panel" — internal
+// build language that has no place here. Checking isDocumentDetected for
+// true/false (only ever set that way by a real analysis) rather than mere
+// object non-emptiness is what actually catches that case and swaps in the
+// clearly-labeled sample data below instead of surfacing that backend text.
+function getDocumentDisplayData(payload) {
+  const idvResult = payload.idv || {status: 'skipped'};
+  const idvOk = idvResult.status === 'ok';
+  const real = idvOk ? idvResult.data : null;
+  const hasRealDoc = !!(real && real.ocrData && (real.ocrData.isDocumentDetected === true || real.ocrData.isDocumentDetected === false));
+  const d = hasRealDoc ? real : buildMockSampleDocumentData(IDV_CONFIG.applicant);
+  // The backend's HTTP response (even when it internally fell back to
+  // mockMode:true) carries an honest analysisMessage explaining WHY --
+  // "no key was ever supplied" reads very differently from "a key was
+  // supplied but the live call itself failed (bad key, wrong provider,
+  // network/CORS, rate limit, timeout)". Both cases look identical from
+  // hasRealDoc's point of view (ocrData.isDocumentDetected is null either
+  // way), which is exactly what made a real live-mode failure
+  // indistinguishable from "never configured" here before this was added --
+  // surfacing the server's own message instead of a fixed generic string
+  // is what makes that difference visible on screen instead of only in the
+  // server's own log output.
+  let serverMessage = (real && typeof real.analysisMessage === 'string') ? real.analysisMessage : null;
+  // v67 internal testing build ONLY: also surface the per-provider error
+  // (e.g. "HTTP 401 Unauthorized", "No API key configured for this
+  // provider") from real.visionProviders. analysisMessage alone only says
+  // "none available" -- it doesn't say WHY a given key failed, which is
+  // the actual question when a real key was entered and this still shows
+  // sample data. The polished client-facing report deliberately never
+  // surfaces visionProviders (see this function's other comments) because
+  // that raw per-engine detail isn't applicant-appropriate; this build's
+  // whole purpose is testing/tuning, so the tradeoff is reversed here.
+  if (real && real.visionProviders) {
+    const providerErrors = Object.entries(real.visionProviders)
+      .filter(([, v]) => v && v.available === false && v.error)
+      .map(([name, v]) => `${name}: ${v.error}`);
+    if (providerErrors.length) {
+      serverMessage = (serverMessage ? serverMessage + ' ' : '') + 'Provider detail — ' + providerErrors.join(' | ');
+    }
+  }
+  return {d, isSample: !hasRealDoc, serverMessage};
+}
+
+// ID CAPTURE STEP — document extraction + barcode/AAMVA data. Vendor-
+// neutral: reads only the backend's top-level ocrData/documentFlags/
+// comparison/barcodeData (already normalized to one result regardless of
+// which analysis engine ran underneath).
+function renderDocumentData(payload) {
+  const container = document.getElementById('rpt-document-data');
+  const {d, isSample, serverMessage} = getDocumentDisplayData(payload);
+  document.getElementById('rpt-mock-banner').style.display = isSample ? 'block' : 'none';
+
+  const ocr = d.ocrData || {};
+  const flags = d.documentFlags || {};
+  const cmp = d.comparison || {};
+  const bc = d.barcodeData || {};
+  // v67.14: PDF417/AAMVA is a US driver's-license/state-ID back-of-card
+  // format only -- a passport has no such barcode, so this card has no
+  // real thing to report on a passport session. It was rendering
+  // unconditionally (always showing sample/placeholder AAMVA fields even
+  // for a passport case), which Erik flagged after running a full
+  // liveness sequence on a passport session. renderCaptureIntegrityPanel()
+  // already branches on docType for the analogous 'Barcode Decode'
+  // capture-integrity card (see renderPassportIntegrityCards()) -- this is
+  // the same fix applied here.
+  const isPassport = payload.docType === 'passport';
+  // v68.15.2: the passport CARD's back-of-card barcode is Code 39, encoding
+  // only the card's own serial number -- not an AAMVA record, so the same
+  // reasoning as isPassport above applies: no real AAMVA fields to show.
+  // A dedicated, much smaller card renders below instead (see
+  // isPassportCard branch further down) -- decode status only, not a
+  // rich field table (this project's own serial-number cross-check
+  // already rides through the Field-by-Field Comparison table via
+  // documentNumber, see live_analysis.py's _parse_code39_text()).
+  const isPassportCard = payload.docType === 'passport_card';
+  // v68.16: 'other' has no known barcode/MRZ format at all (see
+  // safe_idv_capture_other's file header) -- same "nothing real to show"
+  // reasoning as isPassport above, just for a different reason (unbounded
+  // format rather than a different-but-known format).
+  const isOtherDocument = payload.docType === 'other';
+
+  const flagList = Object.entries({
+    'REAL ID': flags.isDriversLicenseRealId, 'Expired': flags.isDocumentExpired,
+    'Invalidated': flags.isInvalidated, 'CDL': flags.isCommercialDriversLicense,
+    'Permit': flags.isPermit, 'Non-Domicile': flags.isNonDomicile,
+  }).filter(([, v]) => v).map(([k]) => k);
+
+  const fieldsRows = (cmp.fields || []).map(f => `
+    <tr>
+      <td data-label="Field" style="color:var(--text-dim);text-transform:uppercase;font-size:10px;">${esc(f.fieldName)}</td>
+      <td data-label="Application">${esc(f.applicationValue ?? '—')}</td>
+      <td data-label="Document"><span style="color:${docMatchColor(f.matchStatus)};">${esc(f.ocrValue ?? '—')}</span></td>
+    </tr>`).join('');
+
+  container.innerHTML = `
+    ${isSample ? `<div class="anomaly-card sev-info" style="animation:none;">
+      <div class="anomaly-label">Sample Values Below</div>
+      <div class="anomaly-desc">${esc(serverMessage || 'No live document analysis ran for this session (required API keys for data analysis not provided or not activated).')} The fields in this section are representative sample values, not measurements of any real document.</div>
+    </div>` : ''}
+    <div class="anomaly-card sev-info" style="border-color:var(--border);background:var(--surface2);animation:none;">
+      <div class="anomaly-label">Document Extraction</div>
+      <div class="anomaly-desc" style="line-height:2.0;font-size:11px;">
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">DOCUMENT DETECTED</span> ${ocr.isDocumentDetected === true ? 'Yes' : ocr.isDocumentDetected === false ? 'No' : '—'} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">EXTRACTION CONFIDENCE</span> ${ocr.extractionConfidence ?? '—'}${ocr.extractionConfidence != null ? '%' : ''} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">DOCUMENT CONFIDENCE</span> ${flags.documentConfidence ?? '—'}${flags.documentConfidence != null ? '%' : ''} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">FIELD MATCH</span> ${cmp.overallMatchScore ?? '—'}${cmp.overallMatchScore != null ? '%' : ''}<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">DOCUMENT FLAGS</span> ${flagList.length ? esc(flagList.join(', ')) : (isSample ? '—' : 'none')}
+        ${isSample ? '' : (ocr.qualityNotes ? `<br><span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">NOTES</span> ${esc(ocr.qualityNotes)}` : '')}
+      </div>
+    </div>
+    ${isPassport || isOtherDocument ? (isOtherDocument ? `<div class="anomaly-card sev-info" style="border-color:var(--border);background:var(--surface2);animation:none;">
+      <div class="anomaly-label">No Structured Verification For This Document Type</div>
+      <div class="anomaly-desc">"Other ID Document" is a deliberate catch-all for documents with no standardized format to verify against (no barcode/MRZ decode is attempted). The Document Extraction fields above are best-effort text the vision model could read off the image — not cross-checked against anything, and not a legitimacy assessment. Capture-integrity signals, geolocation, device fingerprinting, and face comparison below still ran the same as any other session.</div>
+    </div>` : '') : isPassportCard ? `<div class="anomaly-card sev-info" style="border-color:var(--border);background:var(--surface2);animation:none;">
+      <div class="anomaly-label">Barcode Data (Code 39)</div>
+      <div class="anomaly-desc">${isSample ? 'Sample — ' : ''}${esc(bc.decodeStatus || '—')}${(!isSample && bc.decodeNotes) ? ' — ' + esc(bc.decodeNotes) : ''}</div>
+      <div class="anomaly-desc" style="line-height:2.0;font-size:11px;margin-top:6px;">
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">DECODED SERIAL / DOCUMENT #</span> ${esc(bc.documentNumber ?? '—')}
+      </div>
+      <div class="anomaly-desc" style="font-size:10px;margin-top:6px;color:var(--text-dim);">
+        Unlike a driver's license's PDF417, this barcode encodes only the card's own serial number — no structured field record. That value rides into the Field-by-Field Comparison table below under Document Number, so a mismatch against the applicant/OCR value shows up there as an ordinary MISMATCH, same as any other field.
+      </div>
+    </div>` : `<div class="anomaly-card sev-info" style="border-color:var(--border);background:var(--surface2);animation:none;">
+      <div class="anomaly-label">Barcode / AAMVA Data (PDF417)</div>
+      <div class="anomaly-desc">${isSample ? 'Sample — ' : ''}${esc(bc.decodeStatus || '—')}${(!isSample && bc.decodeNotes) ? ' — ' + esc(bc.decodeNotes) : ''}</div>
+      <div class="anomaly-desc" style="line-height:2.0;font-size:11px;margin-top:6px;">
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">DOC CLASS</span> ${esc(bc.documentClass ?? '—')} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">RESTRICTIONS</span> ${esc(bc.restrictionCode ?? '—')} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">ENDORSEMENTS</span> ${esc(bc.endorsementsCode ?? '—')}<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">REAL ID</span> ${bc.isRealId === true ? 'Yes' : bc.isRealId === false ? 'No' : '—'} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">VETERAN</span> ${bc.isVeteran === true ? 'Yes' : bc.isVeteran === false ? 'No' : '—'} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">ORGAN DONOR</span> ${bc.isDonor === true ? 'Yes' : bc.isDonor === false ? 'No' : '—'} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">LIMITED DURATION</span> ${bc.isLimitedDurationDocument === true ? 'Yes' : bc.isLimitedDurationDocument === false ? 'No' : '—'}<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">DOC DISCRIMINATOR</span> ${esc(bc.documentDiscriminator ?? '—')} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">INVENTORY CTRL #</span> ${esc(bc.inventoryControlNumber ?? '—')} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">AAMVA VER</span> ${esc(bc.aamvaVersion ?? '—')} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">IIN</span> ${esc(bc.iin ?? '—')}
+      </div>
+    </div>`}
+    <div style="font-family:var(--mono);font-size:9px;letter-spacing:0.08em;text-transform:uppercase;color:var(--cyan);margin:16px 0 8px;">▸ Field-by-Field Comparison${isSample ? ' (sample)' : ''}</div>
+    <div style="overflow-x:auto;">${fieldsRows
+      ? `<table class="doc-compare-table"><thead><tr><th>Field</th><th>Application</th><th>Document</th></tr></thead><tbody>${fieldsRows}</tbody></table>`
+      : '<div style="color:var(--text-dim);font-size:12px;">No comparable fields available.</div>'}</div>
+  `;
+}
+
+// LIVENESS STEP — face match compares the locked selfie frame against the
+// ID Capture photo, so this is filed under Liveness (it's the last thing
+// that step produces), even though the document image itself was captured
+// earlier.
+function renderFaceMatchData(payload) {
+  const container = document.getElementById('rpt-facematch-data');
+  const {d, isSample} = getDocumentDisplayData(payload);
+  const fm = d.faceMatch || {};
+
+  container.innerHTML = `
+    ${isSample ? `<div class="anomaly-card sev-info" style="animation:none;">
+      <div class="anomaly-label">Sample Values Below</div>
+      <div class="anomaly-desc">No live face-match analysis ran for this session (required API keys for data analysis not provided or not activated). The fields below are representative sample values, not a real assessment.</div>
+    </div>` : ''}
+    <div class="anomaly-card sev-info" style="border-color:var(--border);background:var(--surface2);animation:none;">
+      <div class="anomaly-desc" style="line-height:2.0;font-size:11px;">
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">MATCH STATUS</span> ${esc(fm.matchStatus || '—')} (${fm.matchConfidence ?? '—'}${fm.matchConfidence != null ? '%' : ''}) &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">FAR</span> ${fm.falseAcceptanceRate ?? '—'}<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">ANTI-SPOOF CONFIDENCE</span> ${fm.antiSpoofingConfidence ?? '—'}${fm.antiSpoofingConfidence != null ? '%' : ''} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">SUSPICIOUS PHOTO</span> ${fm.isSuspiciousPhoto === true ? 'Yes' : fm.isSuspiciousPhoto === false ? 'No' : '—'} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">PHOTO TAMPERED</span> ${fm.isPhotoFromDocumentTampered === true ? 'Yes' : fm.isPhotoFromDocumentTampered === false ? 'No' : '—'}<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">ASSESSED AGE (SELFIE/DOC)</span> ${fm.assessedAgeFromSelfie ?? '—'} / ${fm.assessedAgeFromDocument ?? '—'}
+        ${(!isSample && fm.aiNotes) ? `<br><span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">NOTES</span> ${esc(fm.aiNotes)}` : ''}
+      </div>
+    </div>
+  `;
+}
+
+// Application-step telemetry — the intake form's own behavioral/environment
+// signals, forwarded through the handoff (see safe_idv_launch_v70.html's
+// continueToVerification()). Shows every flagged finding plus a summary of
+// the raw signals behind them; absent entirely if this session wasn't
+// escalated from an application form.
+function renderApplicationTelemetry(payload, appGeo) {
+  const container = document.getElementById('rpt-application-telemetry');
+  const ctx = INTAKE_CONTEXT;
+  if (!ctx) {
+    container.innerHTML = `<div class="anomaly-card sev-info" style="animation:none;"><div class="anomaly-label">No Application Data</div><div class="anomaly-desc">This session was not escalated from an application form submission, so no form-step telemetry is available.</div></div>`;
+    return;
+  }
+  const ft = ctx.formTelemetry || {};
+  const beh = ft.behavioral || {};
+  const mouse = beh.mouse || {};
+  const anomalies = ctx.anomalies || [];
+
+  let html = `<div class="anomaly-card sev-info" style="border-color:var(--border);background:var(--surface2);animation:none;">
+    <div class="anomaly-label">Form Completion</div>
+    <div class="anomaly-desc" style="line-height:2.0;font-size:11px;">
+      <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">SIGNAL INTEGRITY SCORE</span> ${ctx.formScore ?? '—'}/100 &nbsp;
+      <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">FINDINGS</span> ${anomalies.length} &nbsp;
+      <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">TIME TO SUBMIT</span> ${beh.timeToSubmitMs != null ? (beh.timeToSubmitMs / 1000).toFixed(1) + 's' : '—'}<br>
+      <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">TOUCH DEVICE</span> ${mouse.touchDevice === true ? 'Yes' : mouse.touchDevice === false ? 'No' : '—'} &nbsp;
+      <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">MOUSE PATH STRAIGHTNESS</span> ${mouse.straightnessRatio != null ? (mouse.straightnessRatio * 100).toFixed(0) + '%' : '—'} &nbsp;
+      <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">PASTE FIELDS</span> ${(beh.pasteFields || []).length} &nbsp;
+      <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">IDLE PERIODS</span> ${(beh.sessionIdlePeriods || []).length}<br>
+      <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">APPLICATION GEOLOCATION</span> ${appGeo || '—'}
+    </div>
+  </div>`;
+
+  html += anomalies.length === 0
+    ? `<div class="anomaly-card sev-pass" style="animation:none;"><div class="anomaly-label">No Findings</div><div class="anomaly-desc">All evaluated form-step signals were within expected ranges.</div></div>`
+    : anomalies.map(a => `
+      <div class="anomaly-card ${a.severity === 'high' ? 'sev-high' : a.severity === 'info' ? 'sev-info' : ''}" style="animation:none;">
+        <div class="anomaly-label">${esc(a.label)}</div>
+        <div class="anomaly-desc">${esc(a.desc)}</div>
+        ${a.value ? `<div class="anomaly-val">Signal: ${esc(a.value)}</div>` : ''}
+      </div>`).join('');
+
+  container.innerHTML = html;
+}
+
+function renderClientReport(payload) {
+  // scoreSession still computes the real underlying signals (challenge
+  // pass rate, IMU/optical correlation, etc.) — only its returned
+  // score/verdict labels are discarded; the anomalies list itself is
+  // genuine per-signal telemetry and is shown below.
+  const {anomalies: livenessAnomalies} = scoreSession(payload);
+
+  document.getElementById('processing-overlay').style.display = 'none';
+  showPage('page-report');
+  document.getElementById('rpt-subject').textContent = 'Session ' + SESSION_ID + ' · ' + new Date().toLocaleString();
+
+  // v67 internal testing build only: populate the Raw Response toggle (see
+  // its button/pre in the HTML above) with the full backend payload, images
+  // redacted to keep it a manageable, copyable size. textContent (not
+  // innerHTML) so this is guaranteed to select/copy as plain text on iOS
+  // Safari regardless of what's inside — no HTML-escaping edge cases.
+  document.getElementById('rpt-raw-debug').textContent =
+    JSON.stringify(redactLargeStringsForDisplay(payload), null, 2);
+
+  // v67.15: Request Payload toggle -- deliberately a NARROWER, separate
+  // panel from Raw Response above. Raw Response is this report page's own
+  // internal data model (everything payload.* holds, including whatever
+  // came back from the engine call); this shows ONLY the exact JSON body
+  // callIdvEngine() actually sends (see requestPayload on every one of its
+  // return paths) -- applicant + images + capture signals, nothing else.
+  // Erik asked for this specifically so the dev team can see/copy/export
+  // "the data set" that would eventually go to a real vendor integration,
+  // without having to mentally subtract the rest of Raw Response's report-
+  // specific fields to find it.
+  document.getElementById('rpt-vendor-payload').textContent =
+    JSON.stringify(redactLargeStringsForDisplay(payload.idv?.requestPayload ?? null), null, 2);
+
+  // "Copy All" for the Raw Response / Request Payload panels — shared
+  // implementation, parameterized by which <pre>/button pair to act on.
+  // Long-press-select-all is reliable on iOS Safari but fiddly with a
+  // payload this long, so give a one-tap option too. navigator.clipboard
+  // needs a secure context (https or localhost); mock_server.py is often
+  // reached over plain http on a LAN address, where that API is
+  // unavailable entirely — not just rejected, so this always has the
+  // execCommand('copy') fallback ready rather than only reaching for it
+  // after a failure.
+  window.copyDebugPanel = function(preId, btnId){
+    const text = document.getElementById(preId).textContent;
+    const btn = document.getElementById(btnId);
+    const original = btn ? btn.textContent : '';
+    function flash(ok){
+      if(!btn) return;
+      btn.textContent = ok ? '✓ Copied' : 'Copy failed — long-press below to select';
+      setTimeout(()=>{ btn.textContent = original; }, 2000);
+    }
+    function fallbackCopy(){
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '0';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.setSelectionRange(0, text.length);
+      let ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+      document.body.removeChild(ta);
+      return ok;
+    }
+    if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => flash(true)).catch(() => flash(fallbackCopy()));
+    } else {
+      flash(fallbackCopy());
+    }
+  };
+
+  // Session Overview — pure session metadata, not attributable to any one
+  // step, so it stays outside the three step groups below.
+  const metaItems = [
+    ['Session ID', SESSION_ID],
+    ['Device Type', payload.device.type],
+    ['Duration', (payload.meta.durationMs / 1000).toFixed(1) + 's'],
+    ['Timezone', payload.device.timezone],
+  ];
+  if (INTAKE_CONTEXT) {
+    metaItems.push(['Escalated From', 'Application form (session ' + (INTAKE_CONTEXT.sessionId || '—') + ')']);
+  }
+  document.getElementById('rpt-meta-grid').innerHTML = metaItems.map(([k, v]) =>
+    `<div style="background:var(--surface2);padding:8px 12px;border-left:2px solid var(--border);">
+      <div style="font-family:var(--mono);font-size:9px;color:var(--text-dim);letter-spacing:0.08em;text-transform:uppercase;">${k}</div>
+      <div style="font-family:var(--mono);font-size:12px;color:var(--text-bright);margin-top:2px;">${esc(String(v))}</div>
+    </div>`).join('');
+
+  const locG = payload.location || {};
+  const fmtGeo = g => g && g.status === 'granted' ? `${g.lat.toFixed(7)}, ${g.lon.toFixed(7)}` : '—';
+
+  // ── APPLICATION STEP ──────────────────────────────────────────────
+  renderApplicationTelemetry(payload, fmtGeo(locG.intakeGeolocation));
+
+  // ── ID CAPTURE STEP ───────────────────────────────────────────────
+  renderDocumentData(payload);
+  renderCaptureIntegrityPanel(payload); // already reviewer-rationale, not a score — reused as-is
+  renderIdCaptureImages(payload);
+
+  // ── LIVENESS SCAN STEP ────────────────────────────────────────────
+  // Liveness Challenges — per-challenge result is a single measurement,
+  // not an overall diagnosis.
+  document.getElementById('rpt-challenges').innerHTML = payload.challenges.map(ch => `
+    <div class="anomaly-card ${ch.passed ? 'sev-pass' : 'sev-high'}" style="animation:none">
+      <div class="anomaly-label">${ch.passed ? '✓' : '✗'} ${(ch.challengeId || ch.type || 'challenge').replace(/_/g, ' ').toUpperCase()}</div>
+      <div class="anomaly-desc">Type: ${ch.type} · Duration: ${(ch.durationMs / 1000).toFixed(1)}s · Response: ${(ch.responseMs / 1000).toFixed(1)}s · IMU samples: ${ch.imuSamplesDuringChallenge || 0} · Face API: ${ch.faceApiAvailable ? 'active' : 'unavailable'}${ch.eyeTrackingMode ? ' · Eye tracking: ' + (ch.eyeTrackingMode === 'facemesh_ear' ? 'FaceMesh EAR' : 'heuristic fallback') : ''}</div>
+    </div>`).join('') || '<div style="color:var(--text-dim);font-size:12px;">No challenges recorded</div>';
+
+  renderSignalGauges(payload, livenessAnomalies); // already vendor/verdict-neutral — reused as-is
+
+  // Device & Environment — collected during this step (the browser/device
+  // running the camera), not the application step.
+  const dv = payload.device;
+  document.getElementById('rpt-device').innerHTML = `
+    <div class="anomaly-card sev-info" style="border-color:var(--border);background:var(--surface2);animation:none;">
+      <div class="anomaly-desc" style="line-height:2.0;font-size:11px;">
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">UA</span> ${esc(dv.userAgent.substring(0,80))}…<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">SCREEN</span> ${dv.screenWidth}×${dv.screenHeight} · ${dv.colorDepth}bit · ${dv.devicePixelRatio}x DPR<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">HARDWARE</span> ${dv.hardwareConcurrency ?? '—'} cores · ${dv.deviceMemory ?? '—'}GB RAM · Touch: ${dv.touchDevice}<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">WebGL</span> ${dv.webgl?.renderer || '—'}<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">CANVAS FP</span> ${dv.canvasFingerprint || '—'}<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">CAPTURE GEOLOCATION</span> ${fmtGeo(locG.captureGeolocation)} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">APPLICATION/CAPTURE LOCATION COMPARISON</span> ${locG.comparison && locG.comparison.status === 'compared'
+          ? locG.comparison.distanceKm.toFixed(3) + ' km apart'
+          : '—'}
+      </div>
+    </div>`;
+
+  renderLocationConsistency(payload);
+
+  // Motion / Optical Correlation — IMU/optical signals only exist on a
+  // device with motion sensors; blank rather than 0 when unavailable.
+  const corr = payload.correlation;
+  document.getElementById('rpt-imu').innerHTML = !corr.available
+    ? `<div class="anomaly-card sev-info" style="border-color:var(--border);background:var(--surface2);animation:none;"><div class="anomaly-desc" style="font-size:11px;">
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">IMU SAMPLES</span> ${payload.imu.sampleCount || '—'} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">AVAILABLE</span> ${payload.imu.available ? 'Yes' : 'No (this device has no motion sensors)'} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">PERMISSION</span> ${payload.imu.available ? (payload.imu.permissionGranted ? 'Granted' : 'Denied') : '—'}
+      </div></div>`
+    : `<div class="anomaly-card sev-info" style="border-color:var(--border);background:var(--surface2);animation:none;">
+        <div class="anomaly-desc" style="line-height:2.0;font-size:11px;">
+          <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">PEARSON r</span> ${corr.pearsonR} &nbsp;
+          <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">IMU GYRO AVG</span> ${corr.imuMeanGyro?.toFixed(4) ?? '—'} rad/s<br>
+          <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">OPTICAL FLOW AVG</span> ${corr.opticalMeanFlow?.toFixed(4) ?? '—'} &nbsp;
+          <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">STATIC RATIO</span> ${((corr.staticPeriodRatio||0)*100).toFixed(0)}%<br>
+          <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">NOTE</span> ${corr.interpretation}
+        </div>
+      </div>`;
+
+  // Liveness Signal Findings
+  document.getElementById('rpt-anomalies').innerHTML = livenessAnomalies.length === 0
+    ? `<div class="anomaly-card sev-pass" style="animation:none;"><div class="anomaly-label">No findings</div><div class="anomaly-desc">All evaluated liveness-step signals are within expected ranges.</div></div>`
+    : livenessAnomalies.map((a) => `
+      <div class="anomaly-card ${a.sev === 'high' ? 'sev-high' : a.sev === 'info' ? 'sev-info' : ''}" style="animation:none">
+        <div class="anomaly-label">${esc(a.label)}</div>
+        <div class="anomaly-desc">${esc(a.desc)}</div>
+        ${a.val?`<div class="anomaly-val">Signal: ${esc(a.val)}</div>`:''}
+      </div>`).join('');
+
+  renderFaceMatchData(payload); // vendor-neutral, mock-fallback aware
+  renderSelfieImage(payload);
+}
+
+// ══════════════════════════════════════════════════════
+// LOCATION CONSISTENCY — GPS (this session's own device) vs. IP geolocation
+// (this session's IDV-engine submission), an anti-spoofing signal separate
+// from the dormant intake-vs-capture comparison above. See buildPayload()'s
+// ipComparison logic and mock_server.py's geolocate_ip() for the full
+// rationale, thresholds, and why Mock Mode skips the network call entirely.
+// ══════════════════════════════════════════════════════
+function renderLocationConsistency(payload) {
+  const locG = payload.location || {};
+  const gps = locG.captureGeolocation;
+  const ipGeo = locG.ipGeolocation;
+  const cmp = locG.ipComparison || {status: 'not_available'};
+  const summaryEl = document.getElementById('rpt-location-summary');
+
+  const gpsText = (gps && gps.status === 'granted')
+    ? `${gps.lat.toFixed(5)}, ${gps.lon.toFixed(5)} (±${Math.round(gps.accuracy || 0)}m)`
+    : `Not available (${gps ? gps.status : 'no data'})`;
+
+  let ipText = 'Not available';
+  let ipCaption = '';
+  if (ipGeo && ipGeo.status === 'resolved') {
+    ipText = `${ipGeo.lat.toFixed(5)}, ${ipGeo.lon.toFixed(5)} — ${[ipGeo.city, ipGeo.region, ipGeo.country].filter(Boolean).join(', ') || 'location unnamed'}`;
+    ipCaption = `IP ${ipGeo.ip || '—'} · ISP: ${ipGeo.isp || '—'} · via ${ipGeo.source}`;
+  } else if (ipGeo && ipGeo.status === 'mock_mode') {
+    ipText = 'Not attempted — Mock Mode session';
+    ipCaption = ipGeo.reason || '';
+  } else if (ipGeo) {
+    ipText = 'Could not be determined';
+    ipCaption = ipGeo.reason || '';
+  }
+
+  let comparisonBanner;
+  if (cmp.status === 'compared') {
+    const milesText = cmp.distanceMiles.toFixed(0) + ' miles apart';
+    comparisonBanner = cmp.flagged
+      ? `<div class="anomaly-card sev-high" style="animation:none;">
+          <div class="anomaly-label">⚠ Location mismatch flagged</div>
+          <div class="anomaly-desc">Device GPS and the network location of this session's identity-verification submission are ${milesText} — beyond the ${cmp.thresholdMiles}-mile consistency threshold. This alone does not prove spoofing (VPNs, corporate networks, and imprecise IP geolocation are all normal, innocent causes) but is worth a reviewer's attention alongside the other signals on this page.</div>
+        </div>`
+      : `<div class="anomaly-card sev-pass" style="animation:none;">
+          <div class="anomaly-label">Locations consistent</div>
+          <div class="anomaly-desc">Device GPS and the network location of this session's identity-verification submission are ${milesText} — within the ${cmp.thresholdMiles}-mile consistency threshold.</div>
+        </div>`;
+  } else if (cmp.status === 'mock_mode') {
+    comparisonBanner = `<div class="anomaly-card sev-info" style="animation:none;"><div class="anomaly-label">Not evaluated — Mock Mode</div><div class="anomaly-desc">${esc((ipGeo && ipGeo.reason) || 'Mock Mode makes no outbound network calls, so IP geolocation was not attempted for this session.')}</div></div>`;
+  } else if (cmp.status === 'incomplete' || cmp.status === 'unavailable' || cmp.status === 'error') {
+    comparisonBanner = `<div class="anomaly-card sev-info" style="animation:none;"><div class="anomaly-label">Comparison not available</div><div class="anomaly-desc">${esc(cmp.reason || (ipGeo && ipGeo.reason) || 'One of the two locations needed for this comparison was not available.')}</div></div>`;
+  } else {
+    comparisonBanner = `<div class="anomaly-card sev-info" style="animation:none;"><div class="anomaly-label">Comparison not available</div><div class="anomaly-desc">This session's IDV-engine call did not complete, so no submission IP is available to compare against device GPS.</div></div>`;
+  }
+
+  summaryEl.innerHTML = `
+    ${comparisonBanner}
+    <div class="anomaly-card sev-info" style="border-color:var(--border);background:var(--surface2);animation:none;">
+      <div class="anomaly-desc" style="line-height:2.0;font-size:11px;">
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">DEVICE GPS</span> ${esc(gpsText)}<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">SUBMISSION IP LOCATION</span> ${esc(ipText)}${ipCaption ? '<br><span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">' + esc(ipCaption) + '</span>' : ''}
+      </div>
+    </div>`;
+
+  renderLocationMap(gps, ipGeo);
+}
+
+function renderLocationMap(gps, ipGeo) {
+  const wrap = document.getElementById('rpt-location-map-wrap');
+  const canPlot = window.L && gps && gps.status === 'granted' && ipGeo && ipGeo.status === 'resolved';
+
+  if (!canPlot) {
+    const reason = !window.L
+      ? 'Map library did not load (no internet connection to the CDN).'
+      : (!ipGeo || ipGeo.status !== 'resolved')
+        ? ((ipGeo && ipGeo.reason) || 'IP-based location is not available for this session.')
+        : 'Device GPS is not available for this session.';
+    wrap.innerHTML = `<div id="location-map-placeholder"><div class="placeholder-text">Map not shown — ${esc(reason)}</div></div>`;
+    return;
+  }
+
+  wrap.innerHTML = `
+    <div id="location-map"></div>
+    <div class="location-legend">
+      <span class="location-legend-item"><span class="location-legend-dot gps"></span>Device GPS</span>
+      <span class="location-legend-item"><span class="location-legend-dot ip"></span>Submission IP (${esc(ipGeo.source)})</span>
+    </div>`;
+
+  // Leaflet needs the container to already have real layout dimensions to
+  // size its tiles correctly -- the innerHTML assignment above puts
+  // #location-map into the DOM synchronously, so by the time this next
+  // line runs, layout has already happened.
+  const map = L.map('location-map', {attributionControl: true, zoomControl: true, scrollWheelZoom: false});
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 18,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors',
+  }).addTo(map);
+
+  const gpsIcon = L.divIcon({className: '', html: '<div style="width:14px;height:14px;border-radius:50%;background:#4DB8C8;border:2px solid #0F1219;"></div>', iconSize: [14,14]});
+  const ipIcon = L.divIcon({className: '', html: '<div style="width:14px;height:14px;border-radius:50%;background:#E8A020;border:2px solid #0F1219;"></div>', iconSize: [14,14]});
+
+  const gpsPoint = [gps.lat, gps.lon];
+  const ipPoint = [ipGeo.lat, ipGeo.lon];
+  L.marker(gpsPoint, {icon: gpsIcon}).addTo(map).bindPopup('Device GPS');
+  L.marker(ipPoint, {icon: ipIcon}).addTo(map).bindPopup('Submission IP' + (ipGeo.city ? ' — ' + esc(ipGeo.city) : ''));
+  L.polyline([gpsPoint, ipPoint], {color: '#7A90AA', weight: 2, dashArray: '4,6'}).addTo(map);
+
+  map.fitBounds([gpsPoint, ipPoint], {padding: [30, 30], maxZoom: 10});
+}
+
+// ══════════════════════════════════════════════════════
+// PAYLOAD ASSEMBLY
+// ══════════════════════════════════════════════════════
+function buildPayload(livenessSignals, captureGeo, ipGeo) {
+  const nav = navigator;
+  const deviceType = detectDeviceType();
+
+  const intakeGeo = INTAKE_CONTEXT && INTAKE_CONTEXT.geolocation;
+  let locationComparison = {status: 'not_available', distanceKm: null};
+  if (intakeGeo && intakeGeo.status === 'granted' && captureGeo && captureGeo.status === 'granted') {
+    const distanceKm = haversineDistanceKm(intakeGeo.lat, intakeGeo.lon, captureGeo.lat, captureGeo.lon);
+    locationComparison = {status: 'compared', distanceKm};
+  } else if (INTAKE_CONTEXT) {
+    locationComparison = {
+      status: 'incomplete',
+      distanceKm: null,
+      intakeStatus: intakeGeo ? intakeGeo.status : 'not_collected',
+      captureStatus: captureGeo ? captureGeo.status : 'unavailable',
+    };
+  }
+
+  // IP-vs-GPS anti-spoofing comparison — see mock_server.py's geolocate_ip()
+  // for the full rationale. This is deliberately separate from the intake-
+  // vs-capture comparison above: that one (dormant in this no-form build)
+  // compares two GPS readings from two different steps; this one compares
+  // THIS session's own device GPS against the network location of the same
+  // session's IDV-engine submission. FLAG_THRESHOLD_MILES is a coarse
+  // anti-spoofing tripwire, not a precision distance check — IP geolocation
+  // is itself only accurate to roughly city/ISP level at best.
+  const FLAG_THRESHOLD_MILES = 200;
+  const KM_TO_MILES = 0.621371;
+  let ipComparison = {status: ipGeo ? ipGeo.status : 'not_available'};
+  if (ipGeo && ipGeo.status === 'resolved' && captureGeo && captureGeo.status === 'granted') {
+    const distanceKm = haversineDistanceKm(ipGeo.lat, ipGeo.lon, captureGeo.lat, captureGeo.lon);
+    const distanceMiles = distanceKm * KM_TO_MILES;
+    ipComparison = {
+      status: 'compared',
+      distanceKm,
+      distanceMiles,
+      flagged: distanceMiles > FLAG_THRESHOLD_MILES,
+      thresholdMiles: FLAG_THRESHOLD_MILES,
+    };
+  } else if (ipGeo && ipGeo.status === 'resolved' && (!captureGeo || captureGeo.status !== 'granted')) {
+    ipComparison = {status: 'incomplete', reason: 'Device GPS was not available for this session (permission denied or unsupported).'};
+  }
+
+  return {
+    intakeContext: INTAKE_CONTEXT,
+    // v67.1: which document type this session actually captured, plus the
+    // MRZ parse result on the passport path (absent/null on the DL path).
+    // renderCaptureIntegrityPanel() branches on docType to show MRZ-specific
+    // cards instead of assuming DL/barcode fields always exist.
+    docType: (IDV_CONFIG.docTypeSelection && IDV_CONFIG.docTypeSelection.docType) || 'drivers_license',
+    mrz: IDV_CONFIG.mrz || null,
+    location: {
+      intakeGeolocation: intakeGeo || null,
+      captureGeolocation: captureGeo || null,
+      comparison: locationComparison,
+      ipGeolocation: ipGeo || null,
+      ipComparison,
+    },
+    meta: {
+      sessionId: SESSION_ID,
+      capturedAt: new Date().toISOString(),
+      sessionStartMs: livenessSignals.sessionStartMs,
+      sessionEndMs: livenessSignals.sessionEndMs,
+      durationMs: livenessSignals.durationMs,
+      engineVersion: '1.0.0-client',
+    },
+    device: {
+      type: deviceType,
+      userAgent: nav.userAgent,
+      platform: nav.platform,
+      language: nav.language,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      timezoneOffset: new Date().getTimezoneOffset(),
+      screenWidth: screen.width, screenHeight: screen.height,
+      devicePixelRatio: window.devicePixelRatio,
+      colorDepth: screen.colorDepth,
+      hardwareConcurrency: nav.hardwareConcurrency,
+      deviceMemory: nav.deviceMemory,
+      maxTouchPoints: nav.maxTouchPoints,
+      touchDevice: nav.maxTouchPoints > 0,
+      connection: getConnectionInfo(),
+      webgl: getWebGLInfo(),
+      canvasFingerprint: getCanvasFingerprint(),
+    },
+    // Defensive fallbacks: scoreSession()/renderClientReport() call .filter(),
+    // .toFixed(), etc. directly on these fields with no null-checks of their
+    // own, on the assumption the liveness handoff always has this exact
+    // shape. If a future liveness-file change (or a partial/corrupted
+    // sessionStorage handoff) ever omits one of them, this previously caused
+    // "View Detailed Report" to throw silently with zero visible symptom --
+    // normalizing to safe empty defaults here means the report can still
+    // render (flagging what's missing via the normal anomaly checks above)
+    // instead of the button appearing to do nothing.
+    imu: livenessSignals.imu || {available: false},
+    optical: livenessSignals.optical || {available: false},
+    correlation: livenessSignals.correlation || {available: false},
+    challenges: livenessSignals.challenges || [],
+    faceApiAvailable: !!livenessSignals.faceApiAvailable,
+    eventCount: livenessSignals.eventCount || 0,
+    events: livenessSignals.events || [],
+  };
+}
+
+function detectDeviceType() {
+  const ua = navigator.userAgent;
+  if (/Android/i.test(ua)) return 'android';
+  if (/iPhone|iPad|iPod/i.test(ua)) return 'ios';
+  if (navigator.maxTouchPoints === 0) return 'desktop';
+  return 'unknown';
+}
+
+function getConnectionInfo() {
+  const c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  return c ? {effectiveType: c.effectiveType, downlink: c.downlink, rtt: c.rtt} : null;
+}
+
+function getWebGLInfo() {
+  try {
+    const c = document.createElement('canvas');
+    const gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+    if (!gl) return null;
+    const di = gl.getExtension('WEBGL_debug_renderer_info');
+    return {
+      renderer: di ? gl.getParameter(di.UNMASKED_RENDERER_WEBGL) : null,
+      vendor:   di ? gl.getParameter(di.UNMASKED_VENDOR_WEBGL)   : null,
+      maxTextureSize: gl.getParameter(gl.MAX_TEXTURE_SIZE),
+    };
+  } catch(e) { return null; }
+}
+
+function getCanvasFingerprint() {
+  try {
+    const c = document.createElement('canvas');
+    c.width = 200; c.height = 40;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle='#f0a'; ctx.fillRect(0,0,200,40);
+    ctx.fillStyle='rgba(0,100,200,0.7)'; ctx.font='14pt Arial';
+    ctx.fillText('SAFE canvas probe', 4, 28);
+    return simpleHash(c.toDataURL());
+  } catch(e) { return null; }
+}
+
+function simpleHash(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = (h * 0x01000193) >>> 0; }
+  return h.toString(16).padStart(8,'0');
+}
+
+function computeImuSummary() {
+  if (!imuSamples.length) return {available: false};
+  const gyroMags = imuSamples.map(s =>
+    Math.sqrt(s.gyroX**2 + s.gyroY**2 + s.gyroZ**2));
+  const avg = arr => arr.reduce((a,b)=>a+b,0)/arr.length;
+  const std = arr => { const m=avg(arr); return Math.sqrt(avg(arr.map(v=>(v-m)**2))); };
+  const staticCount = gyroMags.filter(m => m < 0.02).length;
+  return {
+    sampleCount: imuSamples.length,
+    avgGyroMagnitude: +avg(gyroMags).toFixed(4),
+    stdGyroMagnitude: +std(gyroMags).toFixed(4),
+    maxGyroMagnitude: +Math.max(...gyroMags).toFixed(4),
+    staticPeriodRatio: +(staticCount / gyroMags.length).toFixed(3),
+    motionPlausibility: assessMotionPlausibility(std(gyroMags)),
+  };
+}
+
+function assessMotionPlausibility(stddev) {
+  if (stddev < 0.01) return 0.10; // suspiciously still
+  if (stddev < 0.05) return 0.40;
+  if (stddev < 0.80) return 0.90; // normal human range
+  return 0.60;
+}
+
+function computeOpticalSummary() {
+  if (!opticalFlowSamples.length) return {available: false};
+  const mags = opticalFlowSamples.map(s => s.flowMagnitude);
+  const avg = arr => arr.reduce((a,b)=>a+b,0)/arr.length;
+  return {
+    sampleCount: opticalFlowSamples.length,
+    avgFlowMagnitude: +avg(mags).toFixed(4),
+    maxFlowMagnitude: +Math.max(...mags).toFixed(4),
+    zeroFlowRatio: +(mags.filter(m=>m<0.005).length/mags.length).toFixed(3),
+  };
+}
+
+function computeCorrelation() {
+  if (imuSamples.length < 10 || opticalFlowSamples.length < 5) {
+    return {available: false, reason: 'Insufficient samples'};
+  }
+  // Pearson correlation between IMU magnitude and optical flow
+  const gyroMags = imuSamples.map(s => Math.sqrt(s.gyroX**2+s.gyroY**2+s.gyroZ**2));
+  // Interpolate optical flow to IMU timestamps
+  const optMags = imuSamples.map(s => {
+    const ts = s.timestampMs;
+    // Find nearest optical samples
+    let prev = opticalFlowSamples.find(o => o.timestampMs <= ts);
+    let next = opticalFlowSamples.find(o => o.timestampMs > ts);
+    if (!prev) return opticalFlowSamples[0]?.flowMagnitude || 0;
+    if (!next) return prev.flowMagnitude;
+    const ratio = (ts - prev.timestampMs) / (next.timestampMs - prev.timestampMs);
+    return prev.flowMagnitude + ratio * (next.flowMagnitude - prev.flowMagnitude);
+  });
+
+  const pearson = computePearson(gyroMags, optMags);
+  const imuSummary = computeImuSummary();
+  const optSummary = computeOpticalSummary();
+
+  // Detect motion-without-image-change
+  const motionWithoutImage = imuSummary.avgGyroMagnitude > 0.05 && optSummary.avgFlowMagnitude < 0.01;
+
+  return {
+    available: true,
+    pearsonR: +pearson.toFixed(4),
+    imuMeanGyro: imuSummary.avgGyroMagnitude,
+    opticalMeanFlow: optSummary.avgFlowMagnitude,
+    staticPeriodRatio: imuSummary.staticPeriodRatio,
+    motionPlausibility: imuSummary.motionPlausibility,
+    motionWithoutImageChange: motionWithoutImage,
+    interpretation: interpretCorrelation(pearson, motionWithoutImage, imuSummary.staticPeriodRatio),
+  };
+}
+
+function computePearson(x, y) {
+  const n = Math.min(x.length, y.length);
+  if (n < 5) return 0;
+  const mx = x.slice(0,n).reduce((a,b)=>a+b)/n;
+  const my = y.slice(0,n).reduce((a,b)=>a+b)/n;
+  let num=0, dx2=0, dy2=0;
+  for (let i=0;i<n;i++) {
+    const dxi=x[i]-mx, dyi=y[i]-my;
+    num+=dxi*dyi; dx2+=dxi*dxi; dy2+=dyi*dyi;
+  }
+  const denom = Math.sqrt(dx2*dy2);
+  return denom < 1e-10 ? 0 : num/denom;
+}
+
+function interpretCorrelation(r, motionWithoutImage, staticRatio) {
+  if (motionWithoutImage) return 'SUSPICIOUS: Device moves but image static — possible fixed artifact';
+  if (staticRatio > 0.85) return 'SUSPICIOUS: Device near-static for majority of session';
+  if (r < 0.30) return 'LOW: IMU and optical poorly correlated — possible presentation attack';
+  if (r < 0.60) return 'MODERATE: Partial coupling — inconclusive';
+  return 'GOOD: IMU and optical motion well correlated — consistent with live capture';
+}
+
+// ══════════════════════════════════════════════════════
+// SCORING + ANOMALY DETECTION
+// ══════════════════════════════════════════════════════
+function scoreSession(payload) {
+  const anomalies = [];
+  const flag = (sev, label, desc, val) => anomalies.push({sev, label, desc, val});
+
+  // Challenge results
+  const passed = payload.challenges.filter(c=>c.passed).length;
+  const total  = payload.challenges.length;
+  if (passed === 0) flag('high','All Challenges Failed','No liveness challenges were completed successfully.',`0/${total}`);
+  else if (passed < total) flag('medium','Partial Challenge Completion',`${total-passed} of ${total} challenges were not detected.`,`${passed}/${total} passed`);
+
+  // Face API availability
+  if (!payload.faceApiAvailable) {
+    flag('info','Face Detection Unavailable','Face landmark detection could not load (network restriction or model unavailable). Challenge scoring relied on motion signals only.','face-api not loaded');
+  }
+
+  // IMU
+  const imu = payload.imu;
+  if (!imu.available) {
+    flag('info','No IMU Signal','Device has no motion sensors (desktop). IMU-optical correlation unavailable. Challenge-response is the sole liveness signal.','desktop');
+  } else if (!imu.permissionGranted) {
+    flag('medium','IMU Permission Denied','Motion sensor access was denied. Likely iOS browser context. IMU-optical correlation unavailable — challenge-response is primary signal.','permission denied');
+  } else if (imu.sampleCount < 20) {
+    flag('medium','Insufficient IMU Data',`Only ${imu.sampleCount} IMU samples collected. Minimum for correlation is 20.`,`${imu.sampleCount} samples`);
+  }
+
+  // Correlation
+  const corr = payload.correlation;
+  if (corr.available) {
+    if (corr.motionWithoutImageChange) {
+      flag('high','Motion Without Image Change','Device shows physical movement (IMU) but the camera image is nearly static. Consistent with a fixed artifact (printed photo, mounted screen) being filmed.',`gyro=${corr.imuMeanGyro.toFixed(3)} flow=${corr.opticalMeanFlow.toFixed(3)}`);
+    } else if (corr.pearsonR < 0.30) {
+      flag('high','Low IMU-Optical Correlation',`Pearson r=${corr.pearsonR.toFixed(3)}. Device motion and image motion are decoupled, consistent with a replay or screen-based presentation.`,`r=${corr.pearsonR.toFixed(3)}`);
+    } else if (corr.pearsonR < 0.60) {
+      flag('medium','Moderate Correlation',`Pearson r=${corr.pearsonR.toFixed(3)}. Partial coupling — inconclusive without additional signals.`,`r=${corr.pearsonR.toFixed(3)}`);
+    }
+    if (corr.staticPeriodRatio > 0.85) {
+      flag('medium','High Static Period Ratio',`Device was near-motionless for ${(corr.staticPeriodRatio*100).toFixed(0)}% of the session. Legitimate captures typically show natural hand movement.`,`${(corr.staticPeriodRatio*100).toFixed(0)}% static`);
+    }
+    if (corr.motionPlausibility < 0.30) {
+      flag('medium','Low Motion Plausibility','IMU motion pattern is atypical for a human hand-held capture.','motion unnatural');
+    }
+  }
+
+  // Intake-vs-capture geolocation: only meaningful when this session was
+  // actually escalated from the intake form and both sides have a real
+  // reading to compare. Thresholds account for ordinary GPS/WiFi-based
+  // accuracy drift (typically tens to a few hundred meters, occasionally
+  // more on WiFi-only positioning) rather than flagging on any nonzero
+  // distance, which would make this noisy to the point of useless.
+  const loc = payload.location && payload.location.comparison;
+  if (loc && loc.status === 'compared') {
+    if (loc.distanceKm > 50) {
+      flag('high','Intake/Capture Location Mismatch',`The intake form and this capture step report locations ${loc.distanceKm.toFixed(1)}km apart — far beyond normal GPS/WiFi positioning error. Consistent with the form and capture step being completed by different people in different places (remote assistance), not just device fingerprinting within one step.`,`${loc.distanceKm.toFixed(1)}km apart`);
+    } else if (loc.distanceKm > 1) {
+      flag('medium','Possible Intake/Capture Location Drift',`The intake form and this capture step report locations ${loc.distanceKm.toFixed(2)}km apart — more than typical GPS accuracy alone would explain, though not conclusive (e.g. moving between rooms/floors on WiFi-based positioning can look like this too).`,`${loc.distanceKm.toFixed(2)}km apart`);
+    }
+  } else if (loc && loc.status === 'incomplete') {
+    flag('info','Location Comparison Incomplete',`Could not compare intake and capture locations — intake geolocation: ${loc.intakeStatus}, capture geolocation: ${loc.captureStatus}. At least one side didn't grant location access.`,`intake=${loc.intakeStatus}, capture=${loc.captureStatus}`);
+  }
+
+  // Score
+  let score = 100;
+  anomalies.forEach(a => {
+    if (a.sev==='high') score -= 30;
+    if (a.sev==='medium') score -= 12;
+    if (a.sev==='info') score -= 2;
+  });
+  score = Math.max(0, score);
+  const verdict = score >= 70 ? 'PASS' : score >= 40 ? 'REVIEW' : 'FAIL';
+  return {score, verdict, anomalies};
+}
+
+// ══════════════════════════════════════════════════════
+// REPORT RENDERER
+// ══════════════════════════════════════════════════════
+// Renders the Document & Face Match section using the same card language as
+// the rest of the report (sev-pass / sev-high / sev-info) so it reads as one
+// continuous report rather than a bolted-on second product's output.
+function renderIdvPanel(idvResult, composite) {
+  idvResult = idvResult || {status: 'skipped'};
+  const docSev = composite.documentVerdict === 'PASS' ? 'pass' : composite.documentVerdict === 'REVIEW' ? 'info' : 'high';
+
+  if (idvResult.status !== 'ok') {
+    const label = idvResult.status === 'unavailable' ? 'IDV Engine Not Configured'
+                : idvResult.status === 'skipped' ? 'IDV Engine Not Called'
+                : 'IDV Engine Call Failed';
+    return `<div class="anomaly-card sev-${docSev}" style="animation:none;">
+      <div class="anomaly-label">${esc(label)}</div>
+      <div class="anomaly-desc">${esc(idvResult.reason || 'No further detail available.')}</div>
+      <div class="anomaly-val">Resulting document/face-match verdict: ${composite.documentVerdict} (composited into overall verdict)</div>
+    </div>`;
+  }
+
+  const d = idvResult.data;
+  const fm = d.faceMatch || {};
+  const flags = d.documentFlags || {};
+  const cmp = d.comparison || {};
+
+  const flagList = Object.entries({
+    'REAL ID': flags.isDriversLicenseRealId, 'Expired': flags.isDocumentExpired,
+    'Invalidated': flags.isInvalidated, 'CDL': flags.isCommercialDriversLicense,
+    'Permit': flags.isPermit, 'Non-Domicile': flags.isNonDomicile,
+  }).filter(([,v]) => v).map(([k]) => k);
+
+  return `
+    <div class="anomaly-card sev-${docSev}" style="animation:none;">
+      <div class="anomaly-label">Composite Document/Face Verdict: ${composite.documentVerdict}</div>
+      <div class="anomaly-desc">${esc(composite.documentReasons.join('; ') || '—')}</div>
+      <div class="anomaly-val">Case ${esc(d.caseNumber||'—')} · Engine status: ${esc(d.status||'—')}</div>
+    </div>
+    <div class="anomaly-card sev-info" style="border-color:var(--border);background:var(--surface2);animation:none;">
+      <div class="anomaly-desc" style="line-height:2.0;font-size:11px;">
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">FACE MATCH</span> ${esc(fm.matchStatus||'—')} (${fm.matchConfidence ?? '—'}%) &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">FAR</span> ${fm.falseAcceptanceRate ?? '—'}<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">ANTI-SPOOF</span> ${fm.antiSpoofingConfidence ?? '—'}% &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">SUSPICIOUS PHOTO</span> ${fm.isSuspiciousPhoto ? 'YES' : 'No'} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">PHOTO TAMPERED</span> ${fm.isPhotoFromDocumentTampered ? 'YES' : 'No'}<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">AGE (SELFIE/DOC)</span> ${fm.assessedAgeFromSelfie ?? '—'} / ${fm.assessedAgeFromDocument ?? '—'} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">AGE/GENDER CHECK</span> ${fm.isAgeCheckSuccess?'OK':'FAIL'} / ${fm.isGenderCheckSuccess?'OK':'FAIL'}<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">DOC CONFIDENCE</span> ${flags.documentConfidence ?? '—'}% &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">FIELD MATCH</span> ${cmp.overallMatchScore ?? '—'}%<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">DOCUMENT FLAGS</span> ${flagList.length ? esc(flagList.join(', ')) : 'none'}
+      </div>
+    </div>
+    ${fm.aiNotes ? `<div class="anomaly-card sev-info" style="animation:none;"><div class="anomaly-label">Engine Notes</div><div class="anomaly-desc">${esc(fm.aiNotes)}</div></div>` : ''}`;
+}
+
+// ══════════════════════════════════════════════════════
+// DOCUMENT ANALYSIS PANEL — side-by-side OpenAI vs Claude
+// ══════════════════════════════════════════════════════
+// Everything here was previously visible only by opening the raw JSON
+// debug view and hunting through it by hand. This surfaces the same data
+// (per-provider OCR extraction, face-match assessment, and the field-by-
+// field application/OCR/barcode comparison) as an actual report section,
+// with both vision providers shown side by side so their outputs can be
+// judged against each other directly.
+function docMatchColor(status) {
+  return status === 'MATCH' ? 'var(--green)' : status === 'PARTIAL' ? 'var(--accent)' : status === 'MISMATCH' ? 'var(--red)' : 'var(--text-dim)';
+}
+
+function providerDetailCard(label, p) {
+  if (!p) {
+    return `<div class="anomaly-card sev-info" style="border-color:var(--border);background:var(--surface2);animation:none;">
+      <div class="anomaly-label">${esc(label)}</div>
+      <div class="anomaly-desc">Not configured for this case — no API key was supplied.</div>
+    </div>`;
+  }
+  if (!p.available) {
+    return `<div class="anomaly-card sev-high" style="animation:none;">
+      <div class="anomaly-label">${esc(label)}</div>
+      <div class="anomaly-desc">Call failed: ${esc(p.error || 'unknown error')}</div>
+    </div>`;
+  }
+  const ocr = p.ocrData || {};
+  const fm = p.faceMatch || {};
+  const detected = ocr.isDocumentDetected;
+  const detectedLabel = detected === true ? 'Yes' : detected === false ? 'No — not a document' : 'Unknown';
+  const detectedColor = detected === false ? 'var(--red)' : detected === true ? 'var(--green)' : 'var(--text-dim)';
+  return `<div class="anomaly-card sev-info" style="border-color:var(--border);background:var(--surface2);animation:none;">
+    <div class="anomaly-label">${esc(label)}</div>
+    <div class="anomaly-desc" style="line-height:2.0;font-size:11px;">
+      <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">DOCUMENT DETECTED</span> <span style="color:${detectedColor};">${esc(detectedLabel)}</span> &nbsp;
+      <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">EXTRACTION CONFIDENCE</span> ${ocr.extractionConfidence ?? '—'}%<br>
+      <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">FACE MATCH</span> ${esc(fm.matchStatus || '—')} (${fm.matchConfidence ?? '—'}%) &nbsp;
+      <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">ANTI-SPOOF</span> ${fm.antiSpoofingConfidence ?? '—'}%
+      ${ocr.qualityNotes ? `<br><span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">QUALITY NOTES</span> ${esc(ocr.qualityNotes)}` : ''}
+      ${ocr.tamperNotes ? `<br><span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">TAMPER NOTES</span> ${esc(ocr.tamperNotes)}` : ''}
+      ${fm.aiNotes ? `<br><span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">AI NOTES</span> ${esc(fm.aiNotes)}` : ''}
+    </div>
+  </div>`;
+}
+
+function renderDocCompareTable(vp) {
+  const openai = vp.openai && vp.openai.available ? vp.openai : null;
+  const claude = vp.claude && vp.claude.available ? vp.claude : null;
+  const openaiFields = (openai?.comparison?.fields) || [];
+  const claudeFields = (claude?.comparison?.fields) || [];
+  const anyFields = openaiFields.length ? openaiFields : claudeFields;
+  if (!anyFields.length) {
+    return `<div style="color:var(--text-dim);font-size:12px;">No comparable fields available from either provider.</div>`;
+  }
+  const claudeByName = {};
+  claudeFields.forEach(f => { claudeByName[f.fieldName] = f; });
+  const openaiByName = {};
+  openaiFields.forEach(f => { openaiByName[f.fieldName] = f; });
+
+  const cellFor = (map, providerAvailable, key, label) => {
+    if (!providerAvailable) return `<td data-label="${esc(label)}" style="color:var(--text-dim);">not configured</td>`;
+    const f = map[key];
+    if (!f) return `<td data-label="${esc(label)}" style="color:var(--text-dim);">—</td>`;
+    return `<td data-label="${esc(label)}"><span style="color:${docMatchColor(f.matchStatus)};">${esc(f.ocrValue ?? '—')}</span><span class="doc-match-badge" style="color:${docMatchColor(f.matchStatus)};">${esc(f.matchStatus)}</span></td>`;
+  };
+
+  // Each <td> carries a data-label attribute so the mobile breakpoint (see
+  // .doc-compare-table CSS) can stack rows into labeled card blocks instead
+  // of forcing horizontal scroll on a 4-column table.
+  const rows = anyFields.map(f => `
+    <tr>
+      <td data-label="Field" style="color:var(--text-dim);text-transform:uppercase;font-size:10px;">${esc(f.fieldName)}</td>
+      <td data-label="Application">${esc(f.applicationValue ?? '—')}</td>
+      ${cellFor(openaiByName, !!openai, f.fieldName, 'OpenAI GPT-4o Vision')}
+      ${cellFor(claudeByName, !!claude, f.fieldName, 'Claude Vision')}
+    </tr>`).join('');
+
+  return `<table class="doc-compare-table"><thead><tr>
+    <th>Field</th><th>Application</th><th>OpenAI GPT-4o Vision</th><th>Claude Vision</th>
+  </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderDocumentAnalysisPanel(payload) {
+  const container = document.getElementById('doc-analysis-content');
+  const idvResult = payload.idv || {status: 'skipped'};
+
+  if (idvResult.status !== 'ok') {
+    container.innerHTML = `<div class="anomaly-card sev-info" style="animation:none;">
+      <div class="anomaly-label">No Document Analysis Available</div>
+      <div class="anomaly-desc">${esc(idvResult.reason || 'IDV engine was not called for this session.')}</div>
+    </div>`;
+    return;
+  }
+
+  const d = idvResult.data;
+  const vp = d.visionProviders;
+  if (!vp) {
+    container.innerHTML = `<div class="anomaly-card sev-info" style="animation:none;">
+      <div class="anomaly-label">Mock Mode — No Per-Provider Data</div>
+      <div class="anomaly-desc">This case ran without a configured OpenAI/Anthropic key (mock mode), so no real vision-model analysis was performed and there's no per-provider breakdown to show. See the Document &amp; Face Match summary in the main report panel — it always resolves to REVIEW in this mode, on purpose.</div>
+    </div>`;
+    return;
+  }
+
+  const bc = d.barcodeData || {};
+  container.innerHTML = `
+    <div class="provider-compare-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;">
+      ${providerDetailCard('OpenAI GPT-4o Vision', vp.openai)}
+      ${providerDetailCard('Claude Vision', vp.claude)}
+    </div>
+    <div class="anomaly-card sev-info" style="border-color:var(--border);background:var(--surface2);animation:none;margin-bottom:16px;">
+      <div class="anomaly-label">Barcode Decode · PDF417 (back image — shared, not per-provider)</div>
+      <div class="anomaly-desc">${esc(bc.decodeStatus || '—')}${bc.decodeNotes ? ' — ' + esc(bc.decodeNotes) : ''}</div>
+      ${bc.decodeStatus === 'SUCCESS' || bc.decodeStatus === 'PARTIAL' ? `<div class="anomaly-desc" style="line-height:2.0;font-size:11px;margin-top:6px;">
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">DOC CLASS</span> ${esc(bc.documentClass ?? '—')} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">RESTRICTIONS</span> ${esc(bc.restrictionCode ?? '—')} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">ENDORSEMENTS</span> ${esc(bc.endorsementsCode ?? '—')}<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">REAL ID</span> ${bc.isRealId === true ? 'Yes' : bc.isRealId === false ? 'No' : '—'} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">VETERAN</span> ${bc.isVeteran === true ? 'Yes' : bc.isVeteran === false ? 'No' : '—'} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">ORGAN DONOR</span> ${bc.isDonor === true ? 'Yes' : bc.isDonor === false ? 'No' : '—'} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">LIMITED DURATION</span> ${bc.isLimitedDurationDocument === true ? 'Yes' : bc.isLimitedDurationDocument === false ? 'No' : '—'}<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">DOC DISCRIMINATOR</span> ${esc(bc.documentDiscriminator ?? '—')} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">INVENTORY CTRL #</span> ${esc(bc.inventoryControlNumber ?? '—')} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">AAMVA VER</span> ${esc(bc.aamvaVersion ?? '—')} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">JURISDICTION VER</span> ${esc(bc.jurisdictionVersion ?? '—')} &nbsp;
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">IIN</span> ${esc(bc.iin ?? '—')}
+      </div>` : ''}
+    </div>
+    <div style="font-family:var(--mono);font-size:9px;letter-spacing:0.08em;text-transform:uppercase;color:var(--cyan);margin-bottom:8px;">▸ Field-by-Field Comparison</div>
+    <div style="overflow-x:auto;">${renderDocCompareTable(vp)}</div>
+  `;
+}
+
+function renderReport(payload) {
+  const {score, verdict: livenessVerdict, anomalies} = scoreSession(payload);
+  const composite = compositeVerdict(livenessVerdict, payload.idv || {status: 'skipped', reason: 'IDV engine was not called.'});
+  const verdict = composite.overall;
+  payload.verdict = {
+    outcome: verdict,
+    livenessVerdict: composite.livenessVerdict,
+    livenessScore: score,
+    documentVerdict: composite.documentVerdict,
+    documentReasons: composite.documentReasons,
+    anomalyCount: anomalies.length,
+  };
+
+  document.getElementById('processing-overlay').style.display = 'none';
+  showPage('page-report');
+
+  document.getElementById('rpt-subject').textContent = `Session ${SESSION_ID} · ${payload.device.type}`;
+  const vb = document.getElementById('rpt-verdict-el');
+  vb.className = `verdict-badge verdict-${verdict}`;
+  vb.textContent = verdict;
+
+  const scoreEl = document.getElementById('rpt-score');
+  scoreEl.textContent = score;
+  scoreEl.style.color = livenessVerdict==='PASS'?'var(--green)':livenessVerdict==='REVIEW'?'var(--accent)':'var(--red)';
+  const driver = verdict !== livenessVerdict
+    ? ` (driven by document/face match — liveness alone was ${livenessVerdict})`
+    : (composite.documentVerdict !== 'PASS' ? ` (liveness and document/face match agree)` : '');
+  document.getElementById('rpt-verdict-text').textContent = verdict + ' — ' + (verdict==='PASS'?'Capture integrity established':verdict==='REVIEW'?'Manual review recommended':'Capture integrity failed') + driver;
+  document.getElementById('rpt-anomaly-count').textContent = anomalies.length + ' finding(s)';
+
+  // Meta grid
+  const metaItems = [
+    ['Session ID', SESSION_ID],
+    ['Device Type', payload.device.type],
+    ['Duration', (payload.meta.durationMs/1000).toFixed(1)+'s'],
+    ['Timezone', payload.device.timezone],
+    ['Challenges', payload.challenges.filter(c=>c.passed).length+'/'+payload.challenges.length+' passed'],
+    ['IMU Samples', payload.imu.sampleCount || 0],
+    ['Optical Frames', payload.optical.frameCount || 0],
+    ['Canvas FP', payload.device.canvasFingerprint || '—'],
+  ];
+  if (INTAKE_CONTEXT) {
+    metaItems.push(
+      ['Escalated From', 'Intake form (session ' + (INTAKE_CONTEXT.sessionId || '—') + ')'],
+      ['Form Score', INTAKE_CONTEXT.formScore + ' (' + INTAKE_CONTEXT.formVerdict + ') — below ' + INTAKE_CONTEXT.escalationThreshold + ' threshold']
+    );
+  }
+  const locG = payload.location || {};
+  const fmtGeo = g => g && g.status === 'granted' ? `${g.lat.toFixed(7)}, ${g.lon.toFixed(7)}` : (g ? g.status : '—');
+  metaItems.push(
+    ['Intake Geolocation', fmtGeo(locG.intakeGeolocation)],
+    ['Capture Geolocation', fmtGeo(locG.captureGeolocation)],
+    ['Location Comparison', locG.comparison && locG.comparison.status === 'compared'
+      ? locG.comparison.distanceKm.toFixed(3) + ' km apart'
+      : (locG.comparison ? locG.comparison.status.replace(/_/g,' ') : 'not available')]
+  );
+  document.getElementById('rpt-meta-grid').innerHTML = metaItems.map(([k,v]) =>
+    `<div style="background:var(--surface2);padding:8px 12px;border-left:2px solid var(--border);">
+      <div style="font-family:var(--mono);font-size:9px;color:var(--text-dim);letter-spacing:0.08em;text-transform:uppercase;">${k}</div>
+      <div style="font-family:var(--mono);font-size:12px;color:var(--text-bright);margin-top:2px;">${v}</div>
+    </div>`).join('');
+
+  // Challenges
+  document.getElementById('rpt-challenges').innerHTML = payload.challenges.map(ch => `
+    <div class="anomaly-card ${ch.passed?'sev-pass':'sev-high'}" style="animation:none">
+      <div class="anomaly-label">${ch.passed?'✓':'✗'} ${(ch.challengeId || ch.type || 'challenge').replace(/_/g,' ').toUpperCase()}</div>
+      <div class="anomaly-desc">Type: ${ch.type} · Duration: ${(ch.durationMs/1000).toFixed(1)}s · Response: ${(ch.responseMs/1000).toFixed(1)}s · IMU samples: ${ch.imuSamplesDuringChallenge || 0} · Face API: ${ch.faceApiAvailable?'active':'unavailable'}${ch.eyeTrackingMode ? ' · Eye tracking: ' + (ch.eyeTrackingMode === 'facemesh_ear' ? 'FaceMesh EAR' : 'heuristic fallback') : ''}</div>
+    </div>`).join('') || '<div style="color:var(--text-dim);font-size:12px;">No challenges recorded</div>';
+
+  // Device
+  const d = payload.device;
+  document.getElementById('rpt-device').innerHTML = `
+    <div class="anomaly-card sev-info" style="border-color:var(--border);background:var(--surface2);animation:none;">
+      <div class="anomaly-desc" style="line-height:2.0;font-size:11px;">
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">UA</span> ${esc(d.userAgent.substring(0,80))}…<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">SCREEN</span> ${d.screenWidth}×${d.screenHeight} · ${d.colorDepth}bit · ${d.devicePixelRatio}x DPR<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">HARDWARE</span> ${d.hardwareConcurrency||'?'} cores · ${d.deviceMemory||'?'}GB RAM · Touch: ${d.touchDevice}<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">WebGL</span> ${d.webgl?.renderer||'unavailable'}<br>
+        <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">CANVAS FP</span> ${d.canvasFingerprint||'—'}
+      </div>
+    </div>`;
+
+  // IMU / Correlation
+  const corr = payload.correlation;
+  document.getElementById('rpt-imu').innerHTML = !corr.available
+    ? `<div class="anomaly-card sev-info" style="border-color:var(--border);background:var(--surface2);animation:none;"><div class="anomaly-desc" style="font-size:11px;">IMU: ${payload.imu.sampleCount||0} samples · ${payload.imu.available?'Available':'Not available'} · ${payload.imu.permissionGranted?'Permission granted':'Permission denied/N/A'}</div></div>`
+    : `<div class="anomaly-card sev-info" style="border-color:var(--border);background:var(--surface2);animation:none;">
+        <div class="anomaly-desc" style="line-height:2.0;font-size:11px;">
+          <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">PEARSON r</span> ${corr.pearsonR} &nbsp;
+          <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">IMU GYRO AVG</span> ${corr.imuMeanGyro?.toFixed(4)||'—'} rad/s<br>
+          <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">OPTICAL FLOW AVG</span> ${corr.opticalMeanFlow?.toFixed(4)||'—'} &nbsp;
+          <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">STATIC RATIO</span> ${((corr.staticPeriodRatio||0)*100).toFixed(0)}%<br>
+          <span style="color:var(--text-dim);font-family:var(--mono);font-size:9px;">INTERPRETATION</span> ${corr.interpretation}
+        </div>
+      </div>`;
+
+  // Anomalies
+  document.getElementById('rpt-anomalies').innerHTML = anomalies.length === 0
+    ? `<div class="anomaly-card sev-pass" style="animation:none;"><div class="anomaly-label">No anomalies detected</div><div class="anomaly-desc">All evaluated signals are within expected ranges.</div></div>`
+    : anomalies.map((a,i) => `
+      <div class="anomaly-card sev-${a.sev}" style="animation-delay:${i*50}ms">
+        <div class="anomaly-label">${esc(a.label)}</div>
+        <div class="anomaly-desc">${esc(a.desc)}</div>
+        ${a.val?`<div class="anomaly-val">Signal: ${esc(a.val)}</div>`:''}
+      </div>`).join('');
+
+  // Document & Face Match (Maurice's IDV engine)
+  document.getElementById('rpt-idv').innerHTML = renderIdvPanel(payload.idv, composite);
+
+  // Image Review — selfie / ID front / ID back side by side
+  renderImagePanel(payload);
+
+  // Capture Integrity Signals — reviewer rationale, not a score (see spec doc)
+  renderCaptureIntegrityPanel(payload);
+
+  // Document Analysis — per-provider OCR/face-match, field-by-field
+  renderDocumentAnalysisPanel(payload);
+
+  // Signal analysis
+  renderSignalGauges(payload, anomalies);
+
+  // JSON — redact large embedded strings (base64 image data) before
+  // stringifying/rendering. This panel is for inspecting telemetry, not
+  // for viewing raw image bytes (the Image Review panel already shows
+  // those properly as actual images). Rendering a full base64 blob as one
+  // giant unbroken "word" with word-break:break-all forces the browser to
+  // compute a line-wrap point at every single character — genuinely slow,
+  // especially on mobile — which is most of why report generation could
+  // look hung even though nothing was actually stuck: it was just laying
+  // out megabytes of unreadable text nobody needed to see.
+  document.getElementById('json-view').innerHTML = syntaxHighlight(JSON.stringify(redactLargeStringsForDisplay(payload), null, 2));
+
+  // Debug trace
+  document.getElementById('event-trace').innerHTML = eventLog.map(e =>
+    `<div class="et-row"><span class="et-ts">+${e.ts}s</span><span class="et-type">${e.type}</span><span class="et-detail">${esc(JSON.stringify(e.detail||'').slice(0,80))}</span></div>`
+  ).join('');
+}
+
+// ══════════════════════════════════════════════════════
+// SIGNAL GAUGES
+// ══════════════════════════════════════════════════════
+const SIG_REFS = {
+  pearsonR:          {label:'IMU-Optical Pearson r',   unit:'',     min:-1, low:0.60, high:1.0, max:1.0, higherNormal:true,  src:'Heuristic — lower=suspicious'},
+  staticPeriodRatio: {label:'Static Period Ratio',     unit:'%',    min:0,  low:0,    high:60,  max:100, higherNormal:false, src:'Heuristic — >85% suspicious'},
+  motionPlausibility:{label:'Motion Plausibility',     unit:'',     min:0,  low:0.60, high:1.0, max:1.0, higherNormal:true,  src:'Heuristic — human hand range'},
+  challengePassRate: {label:'Challenge Pass Rate',     unit:'%',    min:0,  low:67,   high:100, max:100, higherNormal:true,  src:'Direct liveness measure'},
+  avgFlowMagnitude:  {label:'Avg Optical Flow',        unit:'',     min:0,  low:0.02, high:0.4, max:1.0, higherNormal:false, src:'Frame differencing'},
+  sessionDurationS:  {label:'Session Duration',        unit:'s',    min:0,  low:15,   high:90,  max:180, higherNormal:false, src:'Heuristic — <10s suspicious'},
+};
+
+function renderSignalGauges(payload, anomalies) {
+  const corr = payload.correlation;
+  const vals = {
+    pearsonR:           corr.available ? (corr.pearsonR + 1) / 2 * 100 : null, // normalize -1..1 to 0..100 for display; override below
+    staticPeriodRatio:  corr.available ? (corr.staticPeriodRatio||0) * 100 : null,
+    motionPlausibility: corr.available ? (corr.motionPlausibility||0) * 100 : null,
+    challengePassRate:  payload.challenges.length ? payload.challenges.filter(c=>c.passed).length/payload.challenges.length*100 : null,
+    avgFlowMagnitude:   payload.optical.summary?.avgFlowMagnitude ?? null,
+    sessionDurationS:   payload.meta.durationMs/1000,
+  };
+  // Override pearsonR display to show actual value
+  const rawVals = {
+    pearsonR: corr.available ? corr.pearsonR : null,
+    staticPeriodRatio: corr.available ? (corr.staticPeriodRatio||0)*100 : null,
+    motionPlausibility: corr.available ? (corr.motionPlausibility||0) : null,
+    challengePassRate: vals.challengePassRate,
+    avgFlowMagnitude: vals.avgFlowMagnitude,
+    sessionDurationS: vals.sessionDurationS,
+  };
+
+  let html = '';
+  for (const [key, ref] of Object.entries(SIG_REFS)) {
+    const raw = rawVals[key];
+    if (raw === null || raw === undefined) {
+      html += buildGauge(ref, null, 'unknown', 'No data');
+      continue;
+    }
+    const inBand = raw >= ref.low && raw <= ref.high;
+    let cls, statusText;
+    if (inBand) { cls='normal'; statusText='Within reference range'; }
+    else if (ref.higherNormal && raw < ref.low) { cls = raw < ref.low * 0.5 ? 'danger' : 'warning'; statusText = 'Below normal — suspicious'; }
+    else if (!ref.higherNormal && raw > ref.high) { cls = raw > ref.high * 1.5 ? 'danger' : 'warning'; statusText = 'Above normal — suspicious'; }
+    else { cls='warning'; statusText='Outside normal range'; }
+    const pct = Math.max(0,Math.min(100,(raw-ref.min)/(ref.max-ref.min)*100));
+    const lowPct = (ref.low-ref.min)/(ref.max-ref.min)*100;
+    const highPct = (ref.high-ref.min)/(ref.max-ref.min)*100;
+    const displayVal = ref.unit === '' && Math.abs(raw) < 2 ? raw.toFixed(3) : Math.round(raw);
+    html += `<div class="sg">
+      <div class="sg-head">
+        <span class="sg-lbl">${ref.label}</span>
+        <span class="sg-val" style="color:var(--${cls==='normal'?'green':cls==='warning'?'accent':'red'})">${displayVal}<span class="sg-unit">${ref.unit}</span></span>
+      </div>
+      <div class="sg-bar-wrap">
+        <div class="sg-band" style="left:${lowPct.toFixed(1)}%;width:${(highPct-lowPct).toFixed(1)}%"></div>
+        <div class="sg-marker ${cls}" style="left:${pct.toFixed(1)}%"></div>
+      </div>
+      <div class="sg-range"><span>${ref.min}${ref.unit}</span><span style="color:var(--cyan);font-size:8px">normal: ${ref.low}–${ref.high}${ref.unit}</span><span>${ref.max}${ref.unit}</span></div>
+      <div class="sg-status ${cls}">${statusText}</div>
+      <div class="sg-src">${ref.src}</div>
+    </div>`;
+  }
+  document.getElementById('signal-grid').innerHTML = html;
+}
+
+function buildGauge(ref, val, cls, statusText) {
+  return `<div class="sg">
+    <div class="sg-head"><span class="sg-lbl">${ref.label}</span><span class="sg-val" style="color:var(--text-dim)">—</span></div>
+    <div class="sg-bar-wrap"><div class="sg-band" style="left:25%;width:50%"></div><div class="sg-marker unknown" style="left:50%"></div></div>
+    <div class="sg-range"><span>${ref.min}</span><span></span><span>${ref.max}</span></div>
+    <div class="sg-status unknown">${statusText}</div>
+    <div class="sg-src">${ref.src}</div>
+  </div>`;
+}
+
+// ══════════════════════════════════════════════════════
+// TOGGLE HANDLERS — mutually exclusive: opening one closes any other that
+// was open. Previously each of the 4 buttons had its own independent click
+// handler, and signal-panel tracked "is it open" via inline style.display
+// while the other three tracked it via a CSS class — two different sources
+// of truth for the same concept. That mismatch is what let a button stay
+// lit ("active") even when its panel had actually been closed, and since
+// nothing stopped multiple panels being open at once, they could stack up
+// and visually overlap. Single table + single toggle function fixes both:
+// one source of truth (the 'open' class) per panel, and closing everything
+// else before opening the requested one.
+// ══════════════════════════════════════════════════════
+const REPORT_TOGGLES = [
+  { btn: 'btn-signal', panel: 'signal-panel' },
+  { btn: 'btn-debug',  panel: 'debug-panel'  },
+  { btn: 'btn-images', panel: 'image-panel'  },
+  { btn: 'btn-doc',    panel: 'doc-panel'    },
+];
+
+function closeAllReportPanels() {
+  REPORT_TOGGLES.forEach(({btn, panel}) => {
+    document.getElementById(panel).classList.remove('open');
+    document.getElementById(btn).classList.remove('active');
+  });
+}
+
+function toggleReportPanel(panelId) {
+  const wasOpen = document.getElementById(panelId).classList.contains('open');
+  closeAllReportPanels();
+  if (!wasOpen) {
+    const entry = REPORT_TOGGLES.find(t => t.panel === panelId);
+    document.getElementById(entry.panel).classList.add('open');
+    document.getElementById(entry.btn).classList.add('active');
+  }
+  adjustPanelHeight();
+}
+
+// Client-facing build: the 4 debug/reviewer toggle buttons (Signal
+// Analysis, Debug Trace, Image Review, Document Analysis) and their panels
+// no longer exist in this page's HTML -- renderClientReport() replaced
+// the internal report entirely (see its own comment). Wiring click
+// handlers onto those now-nonexistent buttons would throw at load time
+// (document.getElementById returns null), so that wiring -- along with
+// toggleReportPanel()/closeAllReportPanels()/adjustPanelHeight() below,
+// which only ever existed to serve it -- is intentionally not run. Left
+// defined but uncalled rather than deleted outright, in case any of this
+// is useful reference for a future internal/reviewer build.
+
+function adjustPanelHeight() {
+  // This calc(100vh - ...) inline height is a desktop-only trick to shrink
+  // the two-pane summary/JSON area so a toggled-open panel (Signal Analysis,
+  // Image Review, Document Analysis, etc.) still fits on one screen without
+  // its own separate scrollbar. On mobile the report is a single naturally-
+  // scrolling column (see @media(max-width:820px) above) — an inline style
+  // always wins over the stylesheet's height:auto there, so leaving this set
+  // was silently overriding the mobile layout and squeezing/overlapping
+  // whatever panel the user just opened (this is why Document Analysis —
+  // where the AAMVA fields live — was hard to find on a phone). Skip it
+  // entirely below the breakpoint and let the CSS own the layout.
+  if (window.matchMedia('(max-width:820px)').matches) {
+    document.getElementById('report-panels').style.height = '';
+    return;
+  }
+  // Only one panel can ever be open now, so just find it (if any) and use
+  // its reserved height — no more summing multiple panels that used to be
+  // able to stack open simultaneously.
+  const PANEL_HEIGHTS = { 'signal-panel':340, 'debug-panel':220, 'image-panel':520, 'doc-panel':560 };
+  const openPanel = REPORT_TOGGLES.map(t => t.panel).find(id => document.getElementById(id).classList.contains('open'));
+  const extra = openPanel ? PANEL_HEIGHTS[openPanel] : 0;
+  document.getElementById('report-panels').style.height = `calc(100vh - 105px - ${extra}px)`;
+}
+
+// Renders the three-up Selfie / ID Front / ID Back comparison. Reads
+// payload.idv.sentImages — the exact images used in (or attempted for) the
+// IDV engine call — rather than re-deriving from config, so this always
+// reflects reality even if the call itself failed or was never configured.
+function renderImagePanel(payload) {
+  const sent = payload.idv?.sentImages || {selfieImage: IDV_CONFIG.selfieImage, frontImage: null, backImage: null, backBarcodeImage: null};
+  const slots = [
+    {label: 'Selfie (Locked Frame)', src: sent.selfieImage},
+    {label: 'ID Front', src: sent.frontImage},
+    {label: 'ID Back', src: sent.backImage},
+    // The zoomed-in barcode-decode crop from autocapture's dedicated barcode
+    // step (absent on the Stock Images path — a plain file upload never has
+    // one). This slot was missing entirely even after sentImages started
+    // carrying the field, which is exactly why it looked like the image
+    // wasn't being sent at all when it actually was.
+    {label: 'Barcode Closeup', src: sent.backBarcodeImage},
+  ];
+  document.getElementById('image-grid').innerHTML = slots.map(s => `
+    <div class="image-slot">
+      <div class="image-slot-label">
+        <span>${esc(s.label)}</span>
+        <span class="image-slot-badge ${s.src ? 'present' : 'missing'}">${s.src ? 'SENT' : 'NOT AVAILABLE'}</span>
+      </div>
+      ${s.src ? `<img src="${s.src}" alt="${esc(s.label)}">` : `<div class="image-slot-empty">No image was available for this slot at the time of the IDV call.</div>`}
+    </div>`).join('');
+}
+
+function imageSlotHtml(label, src) {
+  return `<div class="image-slot">
+    <div class="image-slot-label">
+      <span>${esc(label)}</span>
+      <span class="image-slot-badge ${src ? 'present' : 'missing'}">${src ? 'CAPTURED' : 'NOT AVAILABLE'}</span>
+    </div>
+    ${src ? `<img src="${src}" alt="${esc(label)}">` : `<div class="image-slot-empty">No image was available for this slot.</div>`}
+  </div>`;
+}
+
+// ID CAPTURE STEP images — front/back of the document plus the barcode
+// closeup crop. Same source data as the old renderImagePanel (still
+// defined above, now unused) — split out so it can be filed under the ID
+// Capture step group rather than mixed in with the Liveness selfie.
+function renderIdCaptureImages(payload) {
+  // v67.5: passport captures have no back/barcode at all, and now carry two
+  // extra evidence shots the DL path doesn't have -- branch to a dedicated
+  // set of labels rather than showing "ID Back"/"Barcode Closeup" as
+  // permanently-empty slots on every passport case, same reasoning as
+  // renderCaptureIntegrityPanel's existing docType branch above.
+  if (payload.docType === 'passport') { renderPassportCaptureImages(payload); return; }
+  // v68.16: 'other' has no barcode closeup, no MRZ, and no tilt frames --
+  // showing those slots would just be a permanently-empty grid of "NOT
+  // AVAILABLE" badges. Dedicated set instead: front, back, and the
+  // continuous flip video (see safe_idv_capture_other's SECTION 5).
+  if (payload.docType === 'other') {
+    const sentOther = payload.idv?.sentImages || {};
+    document.getElementById('id-capture-image-grid').innerHTML =
+      imageSlotHtml('ID Front', sentOther.frontImage) +
+      imageSlotHtml('ID Back', sentOther.backImage) +
+      videoSlotHtml('Flip (Front → Back)', IDV_CONFIG.documentImages?.flipVideo, sentOther.frontImage || null);
+    return;
+  }
+  const sent = payload.idv?.sentImages || {frontImage: null, backImage: null, backBarcodeImage: null};
+  // v68.15: tilt/OVI evidence -- the 3 retained angle-response stills (sent
+  // to the live engine, see callIdvEngine()'s sentImages.tiltFrameImages)
+  // plus the tilt gesture video (report-page-only, same as the passport
+  // opening-gesture video -- see videoSlotHtml()'s comment). Both were
+  // previously either dropped entirely (the stills) or nonexistent (the
+  // video) -- see safe_idv_capture_v70.html's changelog.
+  const tiltFrames = sent.tiltFrameImages || [];
+  const tiltFramesHtml = tiltFrames.map((img, i) => imageSlotHtml(`Tilt Frame ${i + 1}`, img)).join('');
+  const tiltVideoHtml = videoSlotHtml('Tilt Gesture (Video)', IDV_CONFIG.documentImages?.tiltGestureVideo, tiltFrames[1] || tiltFrames[0] || null);
+  // v68.15.2: MRZ closeup, passport-card sessions only -- gated rather than
+  // unconditional so a plain DL report doesn't grow a permanently-empty
+  // "MRZ Closeup: NOT AVAILABLE" slot it will never have any use for.
+  const mrzCloseupHtml = payload.docType === 'passport_card'
+    ? imageSlotHtml('MRZ Closeup', sent.backMrzImage) : '';
+  document.getElementById('id-capture-image-grid').innerHTML =
+    imageSlotHtml('ID Front', sent.frontImage) +
+    imageSlotHtml('ID Back', sent.backImage) +
+    imageSlotHtml('Barcode Closeup', sent.backBarcodeImage) +
+    mrzCloseupHtml +
+    tiltFramesHtml +
+    tiltVideoHtml;
+}
+// Gesture video is supporting evidence for a human reviewer and is never
+// included in the vision-provider image request. It is retained directly in
+// IDV_CONFIG.documentImages. A captured Blob works for the live report, while
+// prepareReportVideoEvidence() converts it to a data URL before saving so the
+// durable /reports/{sessionId}.html copy can play after a browser restart.
+function videoSlotHtml(label, source, posterDataUrl) {
+  if (!source) {
+    return `<div class="image-slot">
+      <div class="image-slot-label">
+        <span>${esc(label)}</span>
+        <span class="image-slot-badge missing">NOT AVAILABLE</span>
+      </div>
+      <div class="image-slot-empty">No video was captured for this attempt.</div>
+    </div>`;
+  }
+  const sourceUrl = source instanceof Blob ? URL.createObjectURL(source) : String(source);
+  return `<div class="image-slot" data-video-source="${esc(sourceUrl)}">
+    <div class="image-slot-label">
+      <span>${esc(label)}</span>
+      <span class="image-slot-badge present">LOCAL ONLY</span>
+    </div>
+    <div class="video-thumb">
+      ${posterDataUrl ? `<img src="${posterDataUrl}" alt="${esc(label)}">` : ''}
+      <button type="button" class="video-play-button" onclick="openVideoModal(this.closest('.image-slot').dataset.videoSource)"
+        aria-label="Play ${esc(label)}"><span>▶ Play video</span></button>
+    </div>
+  </div>`;
+}
+// v67.13: no native `controls` on #videoModalPlayer anymore (see the CSS
+// comment above #videoModal) -- toggleVideoModalPlayback() drives a small
+// custom play/pause overlay instead, and onVideoModalFullscreenAttempt()
+// is a defensive backstop that bounces back out if iOS ever tries to take
+// the video fullscreen through some other path. Wired once via
+// videoModalListenersReady so repeated opens don't stack listeners.
+let videoModalListenersReady = false;
+function ensureVideoModalListeners(player) {
+  if (videoModalListenersReady) return;
+  videoModalListenersReady = true;
+  const toggle = document.getElementById('videoModalToggle');
+  const status = document.getElementById('videoModalStatus');
+  const setIcon = () => { toggle.textContent = player.paused ? '▶' : '⏸'; };
+  player.addEventListener('play', setIcon);
+  player.addEventListener('pause', setIcon);
+  player.addEventListener('ended', setIcon);
+  player.addEventListener('loadeddata', () => { if (status) status.textContent = ''; });
+  player.addEventListener('error', () => {
+    if (status) status.textContent = 'This browser could not play the captured video format. Review the still evidence or recapture on a supported browser.';
+  });
+  player.addEventListener('webkitbeginfullscreen', onVideoModalFullscreenAttempt);
+}
+function onVideoModalFullscreenAttempt() {
+  const player = document.getElementById('videoModalPlayer');
+  if (typeof player.webkitExitFullscreen === 'function') player.webkitExitFullscreen();
+}
+function toggleVideoModalPlayback() {
+  const player = document.getElementById('videoModalPlayer');
+  if (player.paused) player.play().catch(e => {
+    const status = document.getElementById('videoModalStatus');
+    if (status) status.textContent = 'Playback could not start: ' + (e.message || 'browser policy or unsupported format') + '.';
+  });
+  else player.pause();
+}
+function openVideoModal(url) {
+  if (!url) return;
+  const player = document.getElementById('videoModalPlayer');
+  const status = document.getElementById('videoModalStatus');
+  ensureVideoModalListeners(player);
+  if (status) status.textContent = 'Loading captured video…';
+  player.src = url;
+  player.load();
+  document.getElementById('videoModal').style.display = 'flex';
+  document.getElementById('videoModalToggle').textContent = '⏸';
+  player.play().catch(e => {
+    if (status) status.textContent = 'Tap the play button to start the captured video.' + (e && e.message ? ' (' + e.message + ')' : '');
+  });
+}
+function closeVideoModal() {
+  const player = document.getElementById('videoModalPlayer');
+  player.pause();
+  document.getElementById('videoModal').style.display = 'none';
+  document.getElementById('videoModalStatus').textContent = '';
+  player.removeAttribute('src');
+  player.load();
+}
+function renderPassportCaptureImages(payload) {
+  const sent = payload.idv?.sentImages || {};
+  document.getElementById('id-capture-image-grid').innerHTML =
+    imageSlotHtml('Closed Cover', sent.closedCoverImage) +
+    imageSlotHtml('Both Pages (Open)', sent.bothPagesImage) +
+    imageSlotHtml('Photo Page (MRZ)', sent.frontImage) +
+    videoSlotHtml('Opening Gesture (Video)', IDV_CONFIG.documentImages?.openingGestureVideo, sent.bothPagesImage);
+}
+
+// LIVENESS STEP image — the one locked selfie frame sent onward; nothing
+// else from this step produces an image worth reviewing.
+function renderSelfieImage(payload) {
+  const sent = payload.idv?.sentImages || {selfieImage: IDV_CONFIG.selfieImage};
+  document.getElementById('liveness-selfie-grid').innerHTML =
+    imageSlotHtml('Selfie (Locked Frame)', sent.selfieImage || IDV_CONFIG.selfieImage);
+}
+
+// ══════════════════════════════════════════════════════
+// CAPTURE INTEGRITY SIGNALS — reviewer-facing rationale, NOT a score.
+// See SAFE_Capture_Signal_Rationale_Spec.md. Every case gets human review
+// regardless of what's shown here; this panel exists to give the reviewer
+// the same context the capture step had, including an honest note on how
+// much weight each signal actually deserves. No automated decision reads
+// this — nothing here should ever be turned into a threshold check without
+// real-world volume to validate it against first.
+// ══════════════════════════════════════════════════════
+function ciCard(label, value, interpretation, reliability, relClass) {
+  return `<div class="sg">
+    <div class="sg-head"><span class="sg-lbl">${esc(label)}</span><span class="sg-val" style="color:var(--text);font-size:12px;">${esc(String(value))}</span></div>
+    <div class="sg-status" style="color:var(--text-dim);background:none;font-size:10px;line-height:1.45;padding:4px 0;">${esc(interpretation)}</div>
+    <div class="sg-src" style="color:var(--${relClass})">${esc(reliability)}</div>
+  </div>`;
+}
+
+// v67.1: the passport path's captureSignals shape (docType, mrzFormat,
+// openCloseGesture, etc. -- see safe_idv_capture_passport_v70.html) is
+// entirely different from the DL path's (device/front/back/barcode/tilt).
+// Rather than let the DL cards below silently render as "No match"/"—" for
+// every field on a passport case (which would be technically non-crashing
+// but uninformative -- there's real signal to show), branch to a dedicated
+// set of cards when this session's document type was a passport.
+// v68.15.2: factored out of renderPassportIntegrityCards() so the same two
+// MRZ cards (Read + Check Digits) can also be appended onto the DEFAULT
+// (DL-shaped) integrity panel for a passport CARD session -- a card has
+// BOTH an MRZ (TD1, back of card) AND the DL-style device/tilt/barcode
+// telemetry the default branch already renders correctly, so it needs
+// cards from both worlds rather than a wholesale separate branch. The
+// booklet passport has no device/tilt/barcode telemetry at all (see
+// renderPassportIntegrityCards() below, now just this plus its two
+// gesture-specific cards), so it keeps its own fully separate branch.
+function mrzIntegrityCardsHtml(payload) {
+  const mrz = payload.mrz || {};
+  const cs = payload.idv?.captureSignals || {};
+  const checks = mrz.checks || {};
+  let html = '';
+  html += ciCard(
+    'MRZ Read',
+    mrz.format ? `${mrz.format} — parsed` : 'Not parsed',
+    mrz.format
+      ? `Document type ${esc(mrz.documentTypeCode||'—')}, issuing country ${esc(mrz.issuingCountry||'—')}. OCR model: ${esc(cs.mrzOcrModel||'unknown')}${cs.mrzOcrModel==='tesseract_fallback_eng' ? ' (custom OCR-B model not installed on this build — see file comment; accuracy is lower on this path)' : ''}.`
+      : 'MRZ could not be read from the captured frame.',
+    'Deterministic parse of a captured frame — reliable once a read succeeds',
+    mrz.format ? 'green' : 'red'
+  );
+  const checkEntries = Object.entries(checks).filter(([,v]) => v !== null);
+  const allChecksPass = checkEntries.length > 0 && checkEntries.every(([,v]) => v === true);
+  html += ciCard(
+    'MRZ Check Digits',
+    checkEntries.length ? (allChecksPass ? 'All valid' : 'One or more failed') : '—',
+    checkEntries.length
+      ? checkEntries.map(([k,v]) => `${esc(k)}: ${v ? 'valid' : 'INVALID'}`).join(' · ')
+      : 'No MRZ data to validate.',
+    'Strong — ICAO 9303 check-digit algorithm, same as every border-control MRZ reader',
+    allChecksPass ? 'green' : (checkEntries.length ? 'red' : 'text-dim')
+  );
+  // v68.15.2: this card previously lived only in renderPassportIntegrityCards()
+  // below, so passport-CARD sessions (which call this shared helper from
+  // renderCaptureIntegrityPanel()'s default branch, not that function) never
+  // showed it at all -- flagged by Erik after a real-device MRZ-fail report
+  // had no attempt count to diagnose from. Moved up here so both paths get it.
+  html += ciCard(
+    'OCR Attempts',
+    cs.ocrAttempts != null ? String(cs.ocrAttempts) : '—',
+    'Number of MRZ OCR passes before a check-digit-valid read was obtained (or before the dedicated MRZ step timed out, on the passport-card path). High attempt counts usually mean glare, blur, or poor framing rather than a fraud signal on their own.',
+    'Informational only',
+    'text-dim'
+  );
+  return html;
+}
+
+function renderPassportIntegrityCards(payload) {
+  const grid = document.getElementById('capture-integrity-grid');
+  const cs = payload.idv?.captureSignals || {};
+  const gesture = cs.openCloseGesture || {};
+  const corr = gesture.correlation || {};
+  const fmtNum = (v, d=3) => (v === null || v === undefined) ? '—' : (+v).toFixed(d);
+
+  let html = mrzIntegrityCardsHtml(payload);
+  html += ciCard(
+    'Open/Close Gesture — Motion Correlation',
+    corr.available ? `r = ${fmtNum(corr.pearsonR,3)} (${corr.sampleCount||0} samples)` : `Unavailable (${esc(corr.reason||'unknown')})`,
+    corr.available
+      ? 'Correlation between device motion (IMU) and a frame-differencing motion proxy during the passport open gesture. Real hand-held handling produces correlated signals; a flat static image or screen replay does not. This is a motion-based presence signal, not document-cover image recognition.'
+      : 'Could not compute a correlation for this session — most commonly no IMU permission/hardware, or the gesture completed too quickly to sample.',
+    'Moderate — same underlying idea as the liveness step\'s correlation check, applied to document handling',
+    corr.available ? (corr.pearsonR > 0.5 ? 'green' : 'accent') : 'text-dim'
+  );
+
+  grid.innerHTML = html;
+}
+
+function renderCaptureIntegrityPanel(payload) {
+  const grid = document.getElementById('capture-integrity-grid');
+  if (payload.docType === 'passport') { renderPassportIntegrityCards(payload); return; }
+  // v68.16: 'other' shares this default (front/back/device-shaped) branch
+  // rather than getting its own -- captureSignals.front/back come from the
+  // same rolling-sample-buffer math as every autocapture burst (see
+  // safe_idv_capture_other's SECTION 4), so Distinct Frame Ratio/Temporal
+  // Flicker/Banding/Moire all render correctly with no changes. Only the
+  // cards that need something this doc type structurally doesn't have
+  // (card-detection-based bezel/nested-rect, a barcode, a tilt gesture) are
+  // gated out below, at the point each one would otherwise render.
+  const isOtherDocument = payload.docType === 'other';
+  const cs = payload.idv?.captureSignals;
+  if (!cs) {
+    grid.innerHTML = `<div class="sg"><div class="sg-status unknown">No capture-integrity signals for this case — either the Stock Images path was used (a plain file upload has none of this to report), or the live-capture data wasn't received.</div></div>`;
+    return;
+  }
+  const dev = cs.device || {};
+  const front = cs.front || {};
+  const back = cs.back || {};
+  const bc = cs.barcode || {};
+  const tilt = cs.tiltResponse || {};
+  const fmtNum = (v, d=3) => (v === null || v === undefined) ? '—' : (+v).toFixed(d);
+  const sideVals = (key, d=3) => `Front: ${fmtNum(front[key], d)} · Back: ${fmtNum(back[key], d)}`;
+
+  let html = '';
+
+  html += ciCard(
+    'Virtual Camera Match',
+    dev.virtualCameraSuspected ? `MATCHED — ${dev.matchedName || 'unnamed'}` : 'No match',
+    dev.virtualCameraSuspected
+      ? 'Camera driver name matched a known virtual-camera/software blocklist entry (OBS, ManyCam, Snap Camera, etc.). A legitimate applicant has no reason to be running one of these.'
+      : 'Camera driver name did not match any known virtual-camera signature.',
+    dev.virtualCameraSuspected ? 'High confidence — exact name match, near-zero false-positive rate' : 'High confidence (clean)',
+    dev.virtualCameraSuspected ? 'red' : 'green'
+  );
+
+  html += ciCard(
+    'Device Capability Mismatch',
+    dev.capabilitiesSuspicious ? 'Flagged' : 'None',
+    dev.capabilitiesSuspicious
+      ? 'The claimed device does not plausibly support what it reported (resolution/capability implausibility via getCapabilities()).'
+      : 'Reported device capabilities were plausible for the claimed hardware.',
+    dev.capabilitiesSuspicious ? 'High confidence when triggered' : 'High confidence (clean)',
+    dev.capabilitiesSuspicious ? 'red' : 'green'
+  );
+
+  html += ciCard(
+    'Distinct Frame Ratio',
+    sideVals('distinctFrameRatio', 3) + ` (of ${front.burstFrames ?? '—'}/${back.burstFrames ?? '—'} frames)`,
+    'Fraction of unique frame-hashes in each capture burst. A real hand-held card produces natural frame-to-frame variation; a looped video or static replay does not — a value near 0 is the strongest replay/static-loop signal in this panel.',
+    'Strong — real hand-held capture essentially never scores near zero here',
+    'green'
+  );
+
+  html += ciCard(
+    'Temporal Flicker (sharpness / luma CoV)',
+    `Sharp CoV — ${sideVals('sharpnessCoV', 3)} · Luma CoV — ${sideVals('lumaCoV', 4)}`,
+    'Scale-free frame-to-frame variation, designed to isolate the flicker a screen recapture adds beyond ordinary hand jitter. Real corroborating signal, but legitimate lighting (fluorescent flicker, etc.) can also produce some variance.',
+    'Moderate — corroborating evidence, not standalone',
+    'accent'
+  );
+
+  // v68.16: bezel/nested-rect/enclosing-rect all depend on a DETECTED
+  // document region (card-shape edge-projection) to measure a band just
+  // outside it -- there is no such detection for 'other' (no known shape
+  // to detect against, see safe_idv_capture_other's file header), so this
+  // card would just show three dashes. Skipped rather than shown empty.
+  if (!isOtherDocument) {
+    const surroundBits = [
+      `bezel ${fmtNum(back.bezelScore,3)}`,
+      `nested-rect ${back.screenFurnitureLines ?? '—'}`,
+      back.enclosingRectEncloses !== undefined ? `enclosing-rect ${back.enclosingRectEncloses ? 'yes' : 'no'} (z=${fmtNum(back.enclosingRectZ,2)})` : null,
+    ].filter(Boolean).join(' · ');
+    html += ciCard(
+      'Surrounding-Frame Signals (combined)',
+      surroundBits || '—',
+      'Bezel score, nested-rectangle detection, and enclosing-rectangle check are all measuring the same underlying thing — a second rectangular edge around the card, like a phone bezel or monitor frame. Grouped here so a real screen-recapture attempt isn\'t counted four times over; no validated formula combines them into one number yet, so the raw sub-values are shown together rather than a fabricated composite.',
+      'Moderate — real signal, not yet weight-calibrated against volume',
+      'accent'
+    );
+  }
+
+  html += ciCard(
+    'Banding',
+    sideVals('banding', 2) + ` (peak: Front ${fmtNum(front.bandingPeak,2)} · Back ${fmtNum(back.bandingPeak,2)})`,
+    'Screen-refresh banding artifact. Ordinary JPEG compression can also produce banding, so this is weak corroborating evidence only.',
+    'Weak — corroborating only',
+    'text-dim'
+  );
+
+  html += ciCard(
+    'Moiré',
+    sideVals('moireScore', 3) + ` (full-res: Front ${fmtNum(front.moireScoreFullRes,3)} · Back ${fmtNum(back.moireScoreFullRes,3)})`,
+    'Frequency-domain screen-recapture check. Tested against a real Retina-class display and found NON-DISCRIMINATING — it could not reliably tell a screen recapture from a genuine photo on modern high-res panels. Shown for completeness, not because it\'s trustworthy evidence.',
+    'Known unreliable — informational only, do not weight',
+    'text-dim'
+  );
+
+  html += ciCard(
+    'White Balance Mode',
+    cs.captureConditions?.whiteBalanceMode || 'not reported',
+    'Camera-reported color-correction mode. Weak on its own — useful only for cross-referencing against other flags above.',
+    'Weak — context only',
+    'text-dim'
+  );
+
+  // v68.16: 'other' never attempts a barcode decode at all (no known
+  // symbology -- see decode_barcode()'s doc_type=='other' early return in
+  // live_analysis.py), so cs.barcode is absent/empty here and this card
+  // would otherwise misleadingly read as "No barcode region found ... after
+  // 0 attempts", implying a barcode was expected and missed.
+  if (!isOtherDocument) {
+    html += ciCard(
+      'Barcode Decode',
+      bc.decoded ? 'Decoded' : (bc.status === 'present_undecodable' ? 'Present, undecodable' : 'No barcode region found'),
+      bc.decoded
+        // v68.15.2: was hardcoded to "PDF417 symbol" -- this card is now also
+        // reached by the passport card path (Code 39), so the wording is
+        // format-neutral. bc.format (see the DL/card capture files'
+        // buildPayload()) still carries the specific symbology if ever
+        // needed here again.
+        ? 'A readable barcode symbol was found during capture.'
+        : bc.status === 'present_undecodable'
+          ? `A barcode-shaped region was detected (presence score ${fmtNum(bc.presenceScore,3)}) but never decoded after ${bc.attempts||0} attempt(s)${bc.timedOutMs?' (timed out)':''} — reads very differently to a reviewer than a barcode that was never in frame at all (worn/damaged card vs. missed capture).`
+          : `No barcode-shaped region was ever detected in frame after ${bc.attempts||0} attempt(s).`,
+      'Strong — well-calibrated, same data used for the actual decode',
+      'green'
+    );
+  }
+
+  // v68.16: 'other' has no tilt/OVI gesture step at all -- there's no known
+  // security-feature layout to check for a tilt response against (see
+  // safe_idv_capture_other's file header), so cs.tiltResponse is absent
+  // here rather than just empty.
+  if (!isOtherDocument) {
+    html += ciCard(
+      'Physical Security Check (Tilt/OVI)',
+      `coverage ${fmtNum(tilt.frac,2)} · samples ${tilt.n ?? '—'} · mean delta ${fmtNum(tilt.meanDelta,3)}`,
+      // v68.15: previously said the retained tilt-frame images "isn't built
+      // yet" -- as of this version they ARE transmitted to the live engine
+      // (see the ID Capture image grid above, and callIdvEngine()'s
+      // sentImages.tiltFrameImages), plus a full gesture video. What still
+      // isn't built is the ANALYSIS: nothing in mock_server.py/live_analysis.py
+      // yet actually inspects those images/video for genuine hologram-response
+      // behavior (hue/specular shift matching a real OVI) rather than just
+      // forwarding them along for human review. Keeping this disclaimer
+      // rather than removing it -- the numeric proxy below is still just a
+      // proxy either way.
+      'This shows the applicant performed a tilting motion for some duration with some measured specular change — it does NOT yet confirm that change matches how a genuine hologram/OVI responds to viewing angle. The retained tilt-frame images and gesture video are now transmitted for review (see the images above), but nothing automatically analyzes them for genuine hologram response yet. Treat this as "tilt was attempted," not "hologram confirmed."',
+      'Proxy only — not yet a forensic finding',
+      'text-dim'
+    );
+  }
+
+  // v68.16: explicit, rather than just an absence of cards -- a reviewer
+  // seeing fewer cards than a DL session should see WHY, not wonder if
+  // something failed to load.
+  if (isOtherDocument) {
+    html += ciCard(
+      'Structured Document Checks',
+      'Not applicable to this document type',
+      'No barcode/MRZ decode and no tilt/OVI security-feature check run for "Other ID Document" sessions — there is no standardized format to check against. The capture-integrity signals above (distinct frame ratio, flicker, banding, moire) and the front/back/flip-video evidence still apply the same as any other session; this document type is intentionally review-by-a-human rather than machine-verified.',
+      'By design — not a missing signal',
+      'text-dim'
+    );
+  }
+
+  // v68.15.2: a passport CARD has an MRZ (TD1, back of card) in addition to
+  // all the DL-shaped telemetry above -- append the same two MRZ cards
+  // the booklet path uses, rather than duplicating a whole branch.
+  if (payload.docType === 'passport_card' && payload.mrz) {
+    html += mrzIntegrityCardsHtml(payload);
+  }
+
+  grid.innerHTML = html;
+}
+
+function restartSession() {
+  if (!confirm('Start a new capture session?')) return;
+  location.reload();
+}
+
+// ── Detection debug overlay ──
+let detDebugVisible = false;
+function esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// Deep-clones a value, replacing any long string (e.g. a base64 data URI)
+// with a short placeholder. Used only for the debug JSON view — never for
+// the actual payload used in scoring/verdict logic or the network call.
+function redactLargeStringsForDisplay(value, seen) {
+  seen = seen || new WeakSet();
+  if (typeof value === 'string') {
+    if (value.length > 300) {
+      const kind = value.startsWith('data:image') ? ', looks like embedded image data' : '';
+      return `[omitted for display — ${value.length.toLocaleString()} chars${kind}]`;
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map(v => redactLargeStringsForDisplay(v, seen));
+  }
+  if (value && typeof value === 'object') {
+    if (seen.has(value)) return '[circular]';
+    seen.add(value);
+    const out = {};
+    for (const k of Object.keys(value)) out[k] = redactLargeStringsForDisplay(value[k], seen);
+    return out;
+  }
+  return value;
+}
+
+function syntaxHighlight(str) {
+  str = str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return str.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+\.?\d*(?:[eE][+\-]?\d+)?)/g, m => {
+    let cls = 'json-num';
+    if (/^"/.test(m)) cls = /:$/.test(m) ? 'json-key' : 'json-str';
+    else if (/true|false/.test(m)) cls = 'json-bool';
+    else if (/null/.test(m)) cls = 'json-null';
+    return `<span class="${cls}">${m}</span>`;
+  });
+}
+
+// v67: holds the most recently built report payload so the confirmation
+// screen's "View Detailed Report" button can render it on demand, without
+// re-submitting. Populated by attemptSubmission() below regardless of
+// whether the submission succeeded — a failed attempt has nothing
+// meaningful to show, but the button is only ever shown on success anyway
+// (see renderConfirmation()), so this stays simple rather than needing to
+// track "do we have a valid payload" separately.
+let lastReportPayload = null;
+
+// v67: this used to call callIdvEngine() + render the full report directly.
+// Split out so the SAME submission attempt can be re-run in place from the
+// confirmation screen's Try Again button (see below) without reloading the
+// page or re-doing capture/liveness -- the selfie/document images are
+// already sitting in IDV_CONFIG in memory by this point, so a retry is
+// just re-asking the same question, not redoing the whole session.
+async function attemptSubmission() {
+  document.getElementById('confirm-submitting').style.display = '';
+  document.getElementById('confirm-success').style.display = 'none';
+  document.getElementById('confirm-error').style.display = 'none';
+  showPage('page-confirmation');
+
+  const idvResult = await callIdvEngine(IDV_CONFIG.selfieImage);
+  // Server-side IP geolocation of THIS submission travels back on the same
+  // /cases response as the analysis result (see mock_server.py's
+  // geolocate_ip()) -- only present when the call actually reached the
+  // server (idvResult.status === 'ok'); absent/null otherwise, which
+  // buildPayload()'s ipComparison logic already treats as "not available".
+  const ipGeo = (idvResult.status === 'ok' && idvResult.data && idvResult.data.ipGeolocation) || null;
+  const payload = buildPayload(IDV_CONFIG.livenessSignals, IDV_CONFIG.livenessSignals.captureGeolocation, ipGeo);
+  payload.idv = idvResult;
+  lastReportPayload = payload;
+
+  renderConfirmation(idvResult);
+  if (idvResult.status === 'ok') {
+    saveReportCopy(payload); // fire-and-forget -- see its own comment for why a failure here must never block or alter the confirmation screen above
+  }
+}
+
+// v70: persists a static, durable copy of the full detailed report to the
+// server (see ReportController/ReportStoreService), so it survives after
+// this tab's sessionStorage/IndexedDB is gone and can be reopened later by
+// URL -- e.g. by Erik, from a completely different browser/machine, without
+// needing this specific session's local browser state. Deliberately reuses
+// renderClientReport() -- the SAME function "View Detailed Report" calls --
+// rather than re-deriving the report HTML some other way, so the saved copy
+// can never visually drift from what a reviewer clicking that button would
+// have seen live.
+//
+// renderClientReport() calls showPage('page-report') itself, which would
+// visibly navigate the applicant away from the confirmation screen they're
+// currently looking at. Rendering it, capturing the finished
+// document.documentElement.outerHTML, and switching back to
+// 'page-confirmation' all happen synchronously with no `await` in between,
+// so the browser never gets a chance to paint the intermediate page-report
+// state -- no visible flash or scroll.
+//
+// Best-effort only: this runs after the real submission has already
+// succeeded (see the idvResult.status === 'ok' check at the call site), so
+// a save failure here (server unreachable, endpoint not deployed yet, etc.)
+// must never surface as an error to the applicant or block anything --
+// it just leaves the permanent-link button hidden.
+async function saveReportCopy(payload) {
+  try {
+    // Re-run defensively in case a host page invoked this helper directly
+    // rather than through runReportPipeline(). It is a no-op for an already
+    // serialized data URL.
+    await prepareReportVideoEvidence();
+    renderClientReport(payload);
+    const html = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
+    showPage('page-confirmation');
+
+    const resp = await fetch('/api/v1/reports/' + encodeURIComponent(SESSION_ID), {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/html' },
+      body: html,
+    });
+    if (!resp.ok) {
+      console.warn('saveReportCopy: server responded', resp.status);
+      return;
+    }
+    const meta = await resp.json();
+    const linkEl = document.getElementById('confirm-saved-report-link');
+    const wrapEl = document.getElementById('confirm-saved-report');
+    if (linkEl && wrapEl && meta.url) {
+      linkEl.href = meta.url;
+      wrapEl.style.display = '';
+    }
+  } catch (e) {
+    // Covers both a renderClientReport() failure and a network failure on
+    // the fetch -- either way, best-effort, nothing to show the applicant.
+    console.warn('saveReportCopy failed (non-fatal):', e.message);
+    showPage('page-confirmation'); // in case the exception happened before the restore above ran
+  }
+}
+
+// v70: figures out which session id THIS particular page load should act
+// on for delete/link purposes. Two genuinely different cases:
+//  1. Live view, right after a real submission on THIS session -- SESSION_ID
+//     (the const declared at the top of this script) is accurate; this is
+//     the only case where it is, since it was just generated for this
+//     specific page load and nothing has reloaded since.
+//  2. A previously-saved /reports/{sessionId}.html file, reopened later
+//     (from the permanent link, or the index page) -- when the browser
+//     re-executes this same <script> block on that reload, SESSION_ID gets
+//     RE-RANDOMIZED to a brand new value (it's `Math.random()...`, not a
+//     frozen value baked in at save time) -- it has nothing to do with the
+//     session this file actually belongs to. The URL path IS the source of
+//     truth in this case; parse the sessionId back out of it instead.
+function resolveReportSessionId() {
+  const m = window.location.pathname.match(/\/reports\/([^\/]+)\.html$/);
+  return m ? decodeURIComponent(m[1]) : SESSION_ID;
+}
+
+async function deleteThisReport() {
+  const sessionId = resolveReportSessionId();
+  if (!confirm('Delete this report and all its data from the server? This cannot be undone.')) return;
+
+  const btn = document.getElementById('rpt-delete-btn');
+  const statusEl = document.getElementById('rpt-delete-status');
+  if (btn) { btn.disabled = true; btn.textContent = 'Deleting…'; }
+
+  try {
+    const resp = await fetch('/api/v1/reports/' + encodeURIComponent(sessionId), { method: 'DELETE' });
+    if (resp.ok || resp.status === 404) {
+      // 404 here means it was already deleted (e.g. a double-click, or a
+      // stale tab) -- from the user's point of view that's the same
+      // successful end state, not an error worth surfacing.
+      if (btn) { btn.style.display = 'none'; }
+      if (statusEl) {
+        statusEl.style.display = '';
+        statusEl.style.color = 'var(--text-dim)';
+        statusEl.innerHTML = '✓ This report has been deleted from the server.'
+          + (window.location.pathname.startsWith('/reports/')
+              ? ' <a href="/reports/index.html" style="color:var(--cyan);">Back to report list</a>'
+              : '');
+      }
+    } else {
+      throw new Error('Server responded ' + resp.status);
+    }
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = '🗑 Delete Report'; }
+    if (statusEl) {
+      statusEl.style.display = '';
+      statusEl.style.color = 'var(--red)';
+      statusEl.textContent = 'Could not delete this report (' + e.message + '). Please try again.';
+    }
+  }
+}
+
+// A network failure or timeout on submission used to render the FULL report
+// anyway, with the real failure silently swallowed into a generic "no API
+// keys configured" banner buried in two sub-sections -- the page looked
+// complete either way, with no indication anything had gone wrong and no
+// way to retry. This is the fix: block advancement to the report entirely
+// until a submission actually succeeds, and show the real reason.
+function renderConfirmation(idvResult) {
+  document.getElementById('confirm-submitting').style.display = 'none';
+  if (idvResult.status === 'ok') {
+    document.getElementById('confirm-success').style.display = '';
+    document.getElementById('confirm-error').style.display = 'none';
+    return;
+  }
+  document.getElementById('confirm-success').style.display = 'none';
+  document.getElementById('confirm-error').style.display = '';
+  const { title, body } = composeSubmissionErrorMessage(idvResult);
+  document.getElementById('confirm-error-title').textContent = title;
+  document.getElementById('confirm-error-body').textContent = body;
+}
+
+// Mirrors the same principle as the liveness step's composeLivenessBlockedMessage():
+// pick copy based on WHAT kind of failure this was (see callIdvEngine()'s
+// `category` field), not a one-size-fits-all message. A timeout or network
+// failure is genuinely a connection problem worth giving advice about; an
+// HTTP error means the request reached the server and it responded with a
+// problem, which "check your connection" would not fix.
+function composeSubmissionErrorMessage(idvResult) {
+  if (idvResult.category === 'timeout') {
+    return {
+      title: 'Submission Timed Out',
+      body: 'Your submission is taking longer than expected — this usually means a weak connection. Move to a stronger WiFi or cellular signal, then tap Try Again.',
+    };
+  }
+  if (idvResult.category === 'network') {
+    return {
+      title: 'Connection Interrupted',
+      body: 'We couldn’t reach the verification service to submit your identity check. Check your internet connection, then tap Try Again.',
+    };
+  }
+  if (idvResult.category === 'http') {
+    return {
+      title: 'Submission Couldn’t Be Completed',
+      body: 'Something went wrong completing your verification. Please tap Try Again — if this keeps happening, contact support.',
+    };
+  }
+  return {
+    title: 'Submission Couldn’t Be Completed',
+    body: (idvResult.reason || 'An unexpected error occurred.') + ' Please tap Try Again.',
+  };
+}
+
+// Only reachable from the success state of the confirmation screen (see
+// #confirm-success above) -- there is no path here from #confirm-error.
+function viewDetailedReport() {
+  if (!lastReportPayload) return;
+  const errEl = document.getElementById('confirm-view-report-error');
+  try {
+    renderClientReport(lastReportPayload); // calls showPage('page-report') itself
+    if (errEl) errEl.style.display = 'none';
+  } catch (e) {
+    // Previously this exception was silently swallowed by the browser (no
+    // try/catch existed here) -- from the applicant's perspective the button
+    // just "did nothing." Surface it instead of hiding it.
+    console.error('viewDetailedReport: renderClientReport failed', e);
+    if (errEl) {
+      errEl.style.display = '';
+      errEl.textContent = 'Could not open the detailed report (' + e.message + '). This is a demo-build rendering issue, not a submission problem -- your verification above was still received.';
+    }
+  }
+}
+
+async function runReportPipeline() {
+  await intakeHandoffPromise;
+
+  // Finish serializing any IndexedDB Blob before either the live report or
+  // the v70 durable report copy can render it. This replaces temporary
+  // page-scoped blob URLs with a self-contained media source.
+  await prepareReportVideoEvidence();
+
+  if (!IDV_CONFIG.livenessSignals || !IDV_CONFIG.selfieImage) {
+    // Distinct from a submission failure below: there is nothing in memory
+    // TO submit (e.g. this page was opened directly, or reloaded after its
+    // one-shot handoff was already consumed) -- no amount of retrying
+    // callIdvEngine() could ever fix that, so the retry button is hidden
+    // and only "Start over" is offered.
+    document.getElementById('confirm-submitting').style.display = 'none';
+    document.getElementById('confirm-error').style.display = '';
+    document.getElementById('confirm-retry-btn').style.display = 'none';
+    document.getElementById('confirm-error-title').textContent = 'No Session Data Received';
+    document.getElementById('confirm-error-body').textContent = 'Please restart from the beginning.';
+    return;
+  }
+
+  await attemptSubmission();
+}
+
+window.addEventListener('load', runReportPipeline);
+</script>
+</body>
+</html>

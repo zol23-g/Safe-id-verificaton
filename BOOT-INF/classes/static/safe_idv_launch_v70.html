@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SAFE — Identity Verification</title>
+<!--
+  v67 — IDV + LIVENESS ONLY BUILD (no form/telemetry step)
+  ==========================================================
+  This replaces client_application_v1.html's role in the original 4-file
+  client-facing build, but ONLY the role of hosting the autocapture iframe
+  and constructing the handoff into the report — none of the actual intake
+  form fields, behavioral telemetry (keystroke/mouse/touch tracking,
+  canvas/WebGL/audio fingerprinting, etc.) exist in this file at all. That
+  product now lives and ships separately (standalone_form_telemetry_v1.html
+  + its own Spring Boot analytics receiver) and is on its own integration
+  path — this build exists purely to test and tune the ID capture +
+  liveness step in isolation, at whatever step of the real process it
+  actually belongs at.
+
+  Flow: safe_idv_setup_v70.html (pick Mock/Live, paste keys) -> HERE (tap
+  Begin, run the LIVENESS iframe first, then the document-capture iframe) ->
+  safe_idv_report_v70.html (results). No applicant identity fields are
+  collected anywhere in this path -- the handoff below deliberately omits
+  `applicant` and `intakeContext` entirely. safe_idv_report_v70.html already
+  handles a missing intakeContext gracefully (see its `if (!ctx)` check in
+  renderApplicationTelemetry / INTAKE_CONTEXT handling) and its document/
+  barcode/liveness panels are driven entirely by the backend analysis
+  payload, not by intake data -- confirmed by reading that file directly,
+  not assumed -- so no changes were needed there for this to work cleanly.
+  The backend's compare_three_way() also treats `applicant` as optional
+  (`applicant = applicant or {}`), so there's no missing-field crash risk
+  server-side either.
+
+  v67 REORDER (this pass): liveness now runs BEFORE document capture, not
+  after. Reasoning: the liveness step depends on BlazeFace loading from a
+  CDN, which can fail for reasons entirely outside the applicant's control
+  (weak connection, blocked script, etc.), and document capture is the
+  slower, more fiddly step for most applicants to get right. Running
+  liveness first means a failed/undiagnosable liveness load surfaces before
+  the applicant sinks time into document capture, rather than after. This
+  pass is a pure reorder + plumbing change -- it does NOT yet hard-block
+  submission on a liveness load failure, add a network-strength diagnostic,
+  or add IP-geolocation comparison. Those are a deliberately separate,
+  deferred second pass so this reorder can be verified on its own first.
+
+  Both steps now run as sequential iframe loads in the SAME fullscreen
+  takeover (no visible transition/card in between): liveness first,
+  reporting completion via postMessage `safeLivenessComplete` with
+  {selfieImage, livenessSignals}; then document capture, reporting via the
+  existing `safeAutocaptureComplete` with {images, captureSignals}. Both
+  results are merged into ONE handoff object here before redirecting to
+  the report page, so safe_idv_report_v70.html's read side only ever sees
+  a single, complete handoff -- it has no idea two separate steps ran.
+
+  v67.1 -- DECIMAL VERSIONING + ID-TYPE INTERVIEW
+  ==========================================================
+  New versioning convention as of this build: vNN stays the primary/DL
+  track; vNN.# is the passport/alt-document-type track, branched off the
+  vNN baseline it started from. This build (v67.1) branched from v67.
+
+  New: a two-question ID-type interview (domestic/international, then
+  document type) runs on THIS page, before the liveness iframe ever loads
+  -- deliberately NOT on safe_idv_setup_v70.html, since that page is
+  operator-only (picks Mock/Live mode) and this interview is applicant-
+  facing. It's placed before liveness rather than between liveness and
+  document capture: liveness itself doesn't need to know the document
+  type, but asking the applicant what they'll be presenting before any
+  capture activity starts (camera permission, biometric work) matches how
+  Persona/Jumio/Onfido-style flows are conventionally sequenced, and avoids
+  the backwards-feeling experience of finishing a liveness/selfie check and
+  only then being asked what document is coming next.
+
+  The interview's answer decides which document-capture iframe loads once
+  liveness completes: DRIVER'S LICENSE routes to the existing
+  safe_idv_capture_v70.html (unchanged DL/card path). PASSPORT (the
+  international, booklet-format case) routes to the new
+  safe_idv_capture_passport_v70.html (MRZ capture + open/close gesture,
+  no NFC -- see that file's own head comment for the full rationale).
+  Every other document type offered in the interview (US passport card,
+  state ID, visa, other) is intentionally NOT wired to a real capture path
+  in this build -- selecting one shows a clear "not yet supported in this
+  test build" message instead of silently failing or crashing. Passport
+  card in particular should reuse the DL path's tilt gesture rather than
+  this build's open/close gesture when it's built -- that's future .#
+  work, not something this build attempts.
+-->
+<style>
+:root{
+  --bg:#0F1219; --surface:#1A2233; --surface2:#212D42;
+  --border:#2A3A52; --border-light:#374d6b;
+  --text:#C8D6E8; --text-dim:#7A90AA; --text-bright:#E8F0F8;
+  --accent:#E8A020; --accent-dim:rgba(232,160,32,0.15); --accent-border:rgba(232,160,32,0.4);
+  --green:#3DB87A; --red:#E85555;
+  --mono:'JetBrains Mono','Fira Code','Consolas',monospace;
+  --sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh;
+  display:flex;align-items:center;justify-content:center;padding:24px;}
+body.idv-capture-active{overflow:hidden;}
+.card{max-width:480px;width:100%;background:var(--surface);border:1px solid var(--border);padding:32px;text-align:center;}
+.logo{display:flex;align-items:center;justify-content:center;gap:10px;margin-bottom:20px;}
+.logo-square{width:28px;height:28px;background:var(--accent);display:flex;align-items:center;
+  justify-content:center;font-family:var(--mono);font-size:11px;font-weight:700;color:#000;}
+.logo-text{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--text-bright);letter-spacing:0.08em;}
+h1{font-size:18px;color:var(--text-bright);margin-bottom:8px;}
+.sub{font-size:13px;color:var(--text-dim);line-height:1.55;margin-bottom:24px;}
+.btn-primary{background:var(--accent);color:#000;border:none;padding:13px 28px;font-family:var(--mono);
+  font-size:12px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;cursor:pointer;}
+.btn-primary:hover{filter:brightness(1.08);}
+.status{font-family:var(--mono);font-size:11px;margin-top:14px;min-height:14px;color:var(--text-dim);}
+
+/* Full-viewport takeover for the capture iframe once started -- same
+   pattern client_application_v1.html used, lifted unchanged. */
+/* position:absolute takes this OUT of body's flex flow entirely -- without
+   it, this iframe (even at height:0) is a second flex item alongside
+   .card, and a flex row with two items centers them AS A GROUP rather than
+   centering .card alone. That's what was pinning the launch card to the
+   top-left instead of centering it (reproduced on desktop too, confirming
+   this was never an iOS-zoom or caching issue at all). The fullscreen
+   variant below already switches to position:fixed once capture starts, so
+   this only matters for the inert, pre-capture state. */
+#idv-autocapture-frame{position:absolute;top:0;left:0;width:100%;height:0;border:none;display:block;}
+#idv-autocapture-frame.idv-fullscreen-frame{
+  position:fixed;inset:0;width:100vw;height:100dvh;z-index:9999;background:#000;
+}
+/* v67.1 -- ID-type interview */
+.interview-q{margin-bottom:18px;text-align:left;}
+.interview-q label{display:block;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;
+  text-transform:uppercase;color:var(--text-dim);margin-bottom:8px;}
+.choice-row{display:flex;gap:8px;flex-wrap:wrap;}
+.choice-btn{flex:1;min-width:100px;padding:10px;background:var(--surface2);border:1px solid var(--border);
+  color:var(--text);font-family:var(--mono);font-size:11px;letter-spacing:0.02em;cursor:pointer;text-align:center;}
+.choice-btn.active{background:var(--accent-dim);border-color:var(--accent-border);color:var(--accent);}
+#doc-type-row{display:none;}
+#doc-type-row.show{display:block;}
+.unsupported-note{font-size:12px;color:var(--red);background:rgba(232,85,85,0.1);border:1px solid rgba(232,85,85,0.3);
+  padding:10px 12px;margin-top:6px;display:none;text-align:left;line-height:1.5;}
+.unsupported-note.show{display:block;}
+#btn-begin-idv[disabled]{opacity:0.4;cursor:not-allowed;}
+</style>
+</head>
+<body>
+
+<div class="card" id="launch-card">
+  <div class="logo"><div class="logo-square">S</div><div class="logo-text">SAFE</div></div>
+  <h1>Identity Verification</h1>
+  <div class="sub">A couple of quick questions about your ID, then a liveness check and document capture.</div>
+
+  <div class="interview-q">
+    <label>Is your ID domestic (U.S.) or international?</label>
+    <div class="choice-row">
+      <div class="choice-btn" id="btn-region-domestic" onclick="setRegion('domestic')">Domestic (U.S.)</div>
+      <div class="choice-btn" id="btn-region-international" onclick="setRegion('international')">International</div>
+    </div>
+  </div>
+
+  <div class="interview-q" id="doc-type-row">
+    <label>What type of document?</label>
+    <div class="choice-row" id="doc-type-choices"></div>
+    <div class="unsupported-note" id="unsupported-note"></div>
+  </div>
+
+  <button class="btn-primary" id="btn-begin-idv" disabled>Begin Identity Verification →</button>
+  <div class="status" id="idv-handoff-status"></div>
+</div>
+
+<iframe id="idv-autocapture-frame" title="Identity verification capture"></iframe>
+
+<script>
+"use strict";
+
+// This page is reached via window.location.href from safe_idv_setup_v70.html
+// right after the operator taps into a text input to paste an API key. If
+// that tap triggered iOS Safari's auto-zoom-on-focus (small inputs) and the
+// navigation happens before the zoom-out animation finishes, the zoomed-in
+// scale can carry through onto THIS page's first paint -- showing a cropped,
+// offset slice of the card rather than the correctly laid-out page. The
+// fields on the setup page are 16px now (below that, iOS auto-zooms), which
+// should stop this at the source -- but resetting here too is cheap
+// insurance against the same class of bug via any future entry point.
+// Momentarily tightening then restoring maximum-scale forces Safari to snap
+// the visual viewport back to 1.0.
+window.addEventListener('pageshow', function(){
+  const m = document.querySelector('meta[name="viewport"]');
+  if (!m) return;
+  const original = m.getAttribute('content');
+  m.setAttribute('content', original + ', maximum-scale=1.0');
+  setTimeout(() => m.setAttribute('content', original), 300);
+});
+
+// ── Config carried from setup ───────────────────────────────────────────
+// v67 REORDER: liveness runs first now, document capture second -- see the
+// head comment above for why. SAFE_LIVENESS_SRC is the new standalone
+// liveness/selfie file extracted out of what used to be an embedded page
+// inside safe_idv_report_v70.html.
+const SAFE_LIVENESS_SRC = 'safe_idv_liveness_v70.html';
+const SAFE_HANDOFF_KEY = 'SAFE_CLIENT_HANDOFF_V1';
+
+// v67.1 -- ID-type interview config. Keyed by region -> array of {value,
+// label, src, supported}. `src` is null and `supported` is false for
+// document types this build doesn't have a real capture path for yet --
+// see this file's head comment for why those are intentionally stubbed
+// rather than attempted.
+// v67.2: "Passport" now appears under BOTH regions, per direct tester
+// feedback -- a US citizen holding their own passport book reasonably
+// expects to find it under Domestic, even though the document itself is
+// used for international travel and its capture requirements (MRZ, no
+// tilt) are the same regardless of which region question got them here.
+// Both entries route to the identical capture file; the region answer is
+// carried through as context (domestic = US-issued, international =
+// non-US-issued) rather than as a second routing fork for this document
+// type specifically.
+//
+// v68.16: State ID Card wired up -- routes to the SAME file as Driver's
+// License, unchanged. A state-issued non-driver ID card is the same ID-1
+// card, the same AAMVA PDF417 barcode standard on the back (the 3-letter
+// field codes our parser scans for -- DAC/DCS/DAQ/etc. -- don't vary
+// between a "DL" and an "ID" compliance subfile, so live_analysis.py's
+// _parse_aamva_text() already handles both with no changes), and no MRZ
+// involved. This is genuinely a "same mechanics, different label" case,
+// unlike passport_card -- nothing new to build, just flip src/supported.
+//
+// v68.16: Visa removed entirely (both regions never actually needed it --
+// there's no standardized visa card/sticker format to build dedicated
+// capture mechanics against, same reasoning that already applied to "Other
+// ID Document"). "Other" now also appears under Domestic, for documents
+// that don't fit any of the standardized tracks above -- tribal ID cards
+// being the motivating case: there's no central AAMVA-style repository or
+// standard format to verify a tribal ID against, and forcing one into
+// "State ID Card" would be wrong (it isn't a state-DMV-issued document).
+// Both regions' "other" route to the same generic catch-all file -- see
+// that file's own header comment for why it's a deliberately different
+// architecture (manual capture, not autocapture) rather than a third
+// variant of the DL skeleton.
+//
+// v68.16: ALLOW_OTHER_DOC_TYPE (set on the setup screen, read from
+// sessionStorage below) represents a customer-level decision -- some
+// schools don't permit "Other" as a submission path at all and always
+// escalate anything-that-doesn't-fit to manual intake instead. Filtered
+// out of both lists at render time in setRegion() rather than removed from
+// this config, so the underlying capture file stays reachable for testing
+// regardless of what a given demo session has toggled.
+const DOC_TYPE_OPTIONS = {
+  domestic: [
+    { value: 'drivers_license', label: "Driver's License", src: 'safe_idv_capture_v70.html', supported: true },
+    { value: 'passport', label: 'Passport', src: 'safe_idv_capture_passport_v70.html', supported: true },
+    // v68.15.2: was a stub anticipating this exact feature (src:null,
+    // supported:false) -- now wired to the new passport-card capture file.
+    // See that file's own header comment for why it's branched from the
+    // DL file's front/tilt/back skeleton rather than the booklet's
+    // cover/opening-gesture skeleton.
+    { value: 'passport_card', label: 'U.S. Passport Card', src: 'safe_idv_capture_passport_card_v70.html', supported: true },
+    { value: 'state_id', label: 'State ID Card', src: 'safe_idv_capture_v70.html', supported: true },
+    { value: 'other', label: 'Other ID Document', src: 'safe_idv_capture_other_v70.html', supported: true },
+  ],
+  international: [
+    { value: 'passport', label: 'Passport', src: 'safe_idv_capture_passport_v70.html', supported: true },
+    { value: 'other', label: 'Other ID Document', src: 'safe_idv_capture_other_v70.html', supported: true },
+  ],
+};
+const DOC_TYPE_STORAGE_KEY = 'SAFE_DOC_TYPE_V1';
+// v68.16: read once at load -- see this file's DOC_TYPE_OPTIONS comment.
+// Defaults to allowed (true) if the setup screen never wrote anything
+// (e.g. this file opened directly, or an older setup screen ran) so this
+// new toggle can't silently turn OFF a feature that isn't there to opt out
+// of yet.
+const ALLOW_OTHER_STORAGE_KEY = 'SAFE_ALLOW_OTHER_V1';
+let allowOtherDocType = true;
+try {
+  const raw = sessionStorage.getItem(ALLOW_OTHER_STORAGE_KEY);
+  if (raw !== null) allowOtherDocType = JSON.parse(raw) !== false;
+} catch (e) { /* keep the permissive default */ }
+
+let selectedRegion = null;
+let selectedDocType = null; // the full option object, not just the value string
+
+function setRegion(region) {
+  selectedRegion = region;
+  selectedDocType = null;
+  document.getElementById('btn-region-domestic').classList.toggle('active', region === 'domestic');
+  document.getElementById('btn-region-international').classList.toggle('active', region === 'international');
+
+  const choicesEl = document.getElementById('doc-type-choices');
+  choicesEl.innerHTML = '';
+  // v68.16: 'other' is filtered out here, not removed from DOC_TYPE_OPTIONS
+  // itself -- see ALLOW_OTHER_STORAGE_KEY's comment above. A school that
+  // doesn't permit it simply never sees the option; the capture file behind
+  // it stays reachable directly (e.g. from the setup screen's test-pathway
+  // selector) regardless.
+  DOC_TYPE_OPTIONS[region]
+    .filter(opt => opt.value !== 'other' || allowOtherDocType)
+    .forEach(opt => {
+      const btn = document.createElement('div');
+      btn.className = 'choice-btn';
+      btn.textContent = opt.label;
+      btn.onclick = () => setDocType(opt);
+      btn.id = 'doc-type-btn-' + opt.value;
+      choicesEl.appendChild(btn);
+    });
+  document.getElementById('doc-type-row').classList.add('show');
+  document.getElementById('unsupported-note').classList.remove('show');
+  updateBeginButtonState();
+}
+
+function setDocType(opt) {
+  selectedDocType = opt;
+  // v68.16: guard against options filtered out of the DOM entirely (a
+  // hidden 'other' when allowOtherDocType is false has no button element
+  // to toggle -- see setRegion()'s filter above).
+  DOC_TYPE_OPTIONS[selectedRegion].forEach(o => {
+    const el = document.getElementById('doc-type-btn-' + o.value);
+    if (el) el.classList.toggle('active', o.value === opt.value);
+  });
+  const noteEl = document.getElementById('unsupported-note');
+  if (!opt.supported) {
+    noteEl.textContent = '"' + opt.label + '" isn\'t wired up to a real capture path in this test build yet -- it\'s shown here so the interview itself is demonstrable end to end. Pick a supported document type to continue.';
+    noteEl.classList.add('show');
+  } else {
+    noteEl.classList.remove('show');
+  }
+  updateBeginButtonState();
+}
+
+function updateBeginButtonState() {
+  const btn = document.getElementById('btn-begin-idv');
+  btn.disabled = !(selectedRegion && selectedDocType && selectedDocType.supported);
+}
+const SAFE_IDB_NAME = 'safe_idv_client_handoff_db';
+const SAFE_IDB_STORE = 'images';
+const SAFE_IDB_KEY = 'documentImages_v1';
+// Same key name safe_idv_report_v70.html reads on the other end -- see its
+// intake-handoff IIFE, which reads this exact key with the same IndexedDB-
+// first / sessionStorage-fallback pattern already used for documentImages.
+const SAFE_IDB_SELFIE_KEY = 'selfieImage_v1';
+
+let capturePhase = 'liveness'; // 'liveness' -> 'document', tracks which iframe is currently loaded
+let livenessResult = null; // {selfieImage, livenessSignals}
+// v67.5: passport path adds closedCoverImage/bothPagesImage alongside
+// frontImage -- see safe_idv_capture_passport_v70.html's finalizeCapture().
+let idvAutocaptureResult = null; // {images:{frontImage,backImage,backBarcodeImage,closedCoverImage,bothPagesImage}, captureSignals}
+
+document.getElementById('btn-begin-idv').addEventListener('click', () => {
+  if (!selectedRegion || !selectedDocType || !selectedDocType.supported) return; // belt-and-suspenders; button is disabled anyway
+  try {
+    sessionStorage.setItem(DOC_TYPE_STORAGE_KEY, JSON.stringify({ region: selectedRegion, docType: selectedDocType.value }));
+  } catch (e) { /* non-fatal -- the choice is already held in memory for this session */ }
+  const frame = document.getElementById('idv-autocapture-frame');
+  frame.classList.add('idv-fullscreen-frame');
+  document.body.classList.add('idv-capture-active');
+  document.getElementById('launch-card').style.display = 'none';
+  capturePhase = 'liveness';
+  frame.src = SAFE_LIVENESS_SRC;
+});
+
+function exitFullscreenCapture() {
+  const frame = document.getElementById('idv-autocapture-frame');
+  frame.classList.remove('idv-fullscreen-frame');
+  document.body.classList.remove('idv-capture-active');
+}
+
+// Same contract as the original host: each step runs in the iframe and
+// reports completion via postMessage rather than reaching into this page's
+// IndexedDB/sessionStorage directly. Two step types now arrive here in
+// sequence -- liveness first, then document capture.
+window.addEventListener('message', (ev) => {
+  if (!ev.data) return;
+
+  if (ev.data.type === 'safeLivenessComplete') {
+    livenessResult = {
+      selfieImage: ev.data.selfieImage || null,
+      livenessSignals: ev.data.livenessSignals || null,
+    };
+    // Stay fullscreen -- just swap the iframe over to document capture next.
+    // No card/transition shown in between, so this reads as one continuous
+    // step to the applicant even though it's two files under the hood.
+    // v67.1: which file loads here depends on the interview answer captured
+    // before liveness started, rather than a single hardcoded source.
+    capturePhase = 'document';
+    const frame = document.getElementById('idv-autocapture-frame');
+    frame.src = (selectedDocType && selectedDocType.src) || 'safe_idv_capture_v70.html';
+    return;
+  }
+
+  if (ev.data.type === 'safeAutocaptureComplete') {
+    idvAutocaptureResult = {
+      images: ev.data.images || {},
+      captureSignals: ev.data.captureSignals || null,
+      mrz: ev.data.mrz || null, // present for the passport path, absent for DL
+    };
+    exitFullscreenCapture();
+    continueToReport();
+    return;
+  }
+});
+
+// ── IndexedDB helpers (identical names/shape to the original client build,
+// so safe_idv_report_v70.html's read side needs no changes) ─────────────
+function safeIdbOpen() {
+  return new Promise((resolve, reject) => {
+    if (!('indexedDB' in window)) { reject(new Error('IndexedDB not available')); return; }
+    const req = indexedDB.open(SAFE_IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(SAFE_IDB_STORE)) {
+        req.result.createObjectStore(SAFE_IDB_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('IndexedDB open failed'));
+  });
+}
+async function safeIdbPut(key, value) {
+  const db = await safeIdbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(SAFE_IDB_STORE, 'readwrite');
+    tx.objectStore(SAFE_IDB_STORE).put(value, key);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+async function continueToReport() {
+  const statusEl = document.getElementById('idv-handoff-status');
+
+  if (!livenessResult) {
+    // Shouldn't be reachable -- document capture only starts after liveness
+    // reports completion -- but guard anyway rather than hand off a partial
+    // report silently.
+    statusEl.textContent = 'Liveness check did not complete — please try again.';
+    document.getElementById('launch-card').style.display = '';
+    return;
+  }
+  if (!idvAutocaptureResult || !idvAutocaptureResult.images.frontImage) {
+    statusEl.textContent = 'Document capture did not complete — please try again.';
+    document.getElementById('launch-card').style.display = '';
+    return;
+  }
+  statusEl.textContent = 'Preparing handoff…';
+
+  const documentImages = { frontImage: idvAutocaptureResult.images.frontImage };
+  if (idvAutocaptureResult.images.backImage) documentImages.backImage = idvAutocaptureResult.images.backImage;
+  if (idvAutocaptureResult.images.backBarcodeImage) documentImages.backBarcodeImage = idvAutocaptureResult.images.backBarcodeImage;
+  // v68.15.2: passport-card-only MRZ closeup evidence -- see that file's
+  // dedicated MRZ step (beginMrzStep()/mrzStepTick()). Absent on every
+  // other path, guarded the same way as backBarcodeImage above.
+  if (idvAutocaptureResult.images.backMrzImage) documentImages.backMrzImage = idvAutocaptureResult.images.backMrzImage;
+  // v67.5: passport-only evidence shots (closed cover, both pages open) --
+  // absent on the DL path, so guarded the same way as backImage/backBarcodeImage above.
+  if (idvAutocaptureResult.images.closedCoverImage) documentImages.closedCoverImage = idvAutocaptureResult.images.closedCoverImage;
+  if (idvAutocaptureResult.images.bothPagesImage) documentImages.bothPagesImage = idvAutocaptureResult.images.bothPagesImage;
+  // v67.11: opening-gesture video evidence -- a Blob, not a base64 string
+  // like the stills above (see safe_idv_capture_passport_v70.html's
+  // file-level comment on openingGestureRecorder for why it was added).
+  if (idvAutocaptureResult.images.openingGestureVideo) documentImages.openingGestureVideo = idvAutocaptureResult.images.openingGestureVideo;
+  // v68.15: DL-path tilt/OVI evidence -- tiltFrameImages is an array of
+  // base64 stills (same string-handoff treatment as the others above);
+  // tiltGestureVideo is a Blob, same treatment as openingGestureVideo below.
+  if (idvAutocaptureResult.images.tiltFrameImages && idvAutocaptureResult.images.tiltFrameImages.length) documentImages.tiltFrameImages = idvAutocaptureResult.images.tiltFrameImages;
+  if (idvAutocaptureResult.images.tiltGestureVideo) documentImages.tiltGestureVideo = idvAutocaptureResult.images.tiltGestureVideo;
+  // v68.16: 'other' doc-type evidence -- flipVideo is a Blob spanning the
+  // front shutter press through the back shutter press (see
+  // safe_idv_capture_other's SECTION 5), same report-page-only treatment
+  // as openingGestureVideo/tiltGestureVideo above. Absent on every other path.
+  if (idvAutocaptureResult.images.flipVideo) documentImages.flipVideo = idvAutocaptureResult.images.flipVideo;
+  const captureSignals = idvAutocaptureResult.captureSignals;
+
+  // No `applicant` and no `intakeContext` -- there is no form step in this
+  // build. safe_idv_report_v70.html treats both as optional (confirmed by
+  // reading its handoff-read code directly).
+  const handoff = {};
+  if (captureSignals) handoff.captureSignals = captureSignals;
+  // v67.1: doc-type interview answer + MRZ result (passport path only) ride
+  // along in the handoff so the report can render a document-type-aware
+  // panel instead of assuming DL/barcode fields always exist.
+  if (selectedRegion && selectedDocType) {
+    handoff.docTypeSelection = { region: selectedRegion, docType: selectedDocType.value };
+  }
+  if (idvAutocaptureResult.mrz) handoff.mrz = idvAutocaptureResult.mrz;
+  // livenessSignals is bounded (IMU samples capped at 200, no raw images)
+  // so it goes straight into the sessionStorage handoff JSON -- only the
+  // selfie image itself needs the IndexedDB treatment below.
+  if (livenessResult.livenessSignals) handoff.livenessSignals = livenessResult.livenessSignals;
+
+  // Large images go to IndexedDB (sessionStorage's quota is far too small
+  // for full-resolution phone photos); only fall back to embedding them in
+  // the sessionStorage handoff if IndexedDB itself is unavailable. The
+  // locked selfie frame gets the same treatment under its own key.
+  let usedIndexedDb = false;
+  try {
+    await safeIdbPut(SAFE_IDB_KEY, documentImages);
+    usedIndexedDb = true;
+  } catch (e) {
+    console.warn('IndexedDB handoff failed, falling back to sessionStorage:', e.message);
+  }
+  if (!usedIndexedDb) {
+    handoff.documentImages = documentImages;
+    // v67.11: openingGestureVideo is a Blob -- JSON.stringify (below, for
+    // the sessionStorage write) can't meaningfully serialize a Blob, so if
+    // we're already in this degraded IndexedDB-unavailable path, drop it
+    // rather than silently write corrupted data for that one field. The
+    // stills stay fine here since they're already base64 text.
+    if (handoff.documentImages.openingGestureVideo) delete handoff.documentImages.openingGestureVideo;
+    // v68.15: same treatment for the DL path's tilt gesture video -- also a
+    // Blob. tiltFrameImages stays fine here too (base64 text, like the
+    // stills above).
+    if (handoff.documentImages.tiltGestureVideo) delete handoff.documentImages.tiltGestureVideo;
+  }
+
+  if (livenessResult.selfieImage) {
+    let usedIndexedDbForSelfie = false;
+    try {
+      await safeIdbPut(SAFE_IDB_SELFIE_KEY, livenessResult.selfieImage);
+      usedIndexedDbForSelfie = true;
+    } catch (e) {
+      console.warn('IndexedDB selfie handoff failed, falling back to sessionStorage:', e.message);
+    }
+    if (!usedIndexedDbForSelfie) {
+      handoff.selfieImage = livenessResult.selfieImage;
+    }
+  }
+
+  try {
+    sessionStorage.setItem(SAFE_HANDOFF_KEY, JSON.stringify(handoff));
+  } catch (e) {
+    statusEl.textContent = 'Could not hand off to Identity Verification: ' + e.message
+      + ' (the ID images may be too large — try again).';
+    return;
+  }
+  statusEl.textContent = 'Redirecting…';
+  window.location.href = 'safe_idv_report_v70.html';
+}
+</script>
+</body>
+</html>

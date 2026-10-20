@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SAFE — Demo Setup</title>
+<style>
+:root{
+  --bg:#0F1219; --surface:#1A2233; --surface2:#212D42;
+  --border:#2A3A52; --border-light:#374d6b;
+  --text:#C8D6E8; --text-dim:#7A90AA; --text-bright:#E8F0F8;
+  --accent:#E8A020; --accent-dim:rgba(232,160,32,0.15); --accent-border:rgba(232,160,32,0.4);
+  --green:#3DB87A; --mono:'JetBrains Mono','Fira Code','Consolas',monospace;
+  --sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh;
+  display:flex;align-items:center;justify-content:center;padding:24px;}
+.card{max-width:520px;width:100%;background:var(--surface);border:1px solid var(--border);padding:32px;}
+.logo{display:flex;align-items:center;gap:10px;margin-bottom:24px;}
+.logo-square{width:28px;height:28px;background:var(--accent);display:flex;align-items:center;
+  justify-content:center;font-family:var(--mono);font-size:11px;font-weight:700;color:#000;}
+.logo-text{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--text-bright);letter-spacing:0.08em;}
+h1{font-size:18px;color:var(--text-bright);margin-bottom:8px;}
+.sub{font-size:13px;color:var(--text-dim);line-height:1.55;margin-bottom:20px;}
+.notice{background:var(--surface2);border-left:3px solid var(--accent);padding:13px 14px;
+  font-size:12px;line-height:1.55;color:var(--text);margin-bottom:18px;}
+.notice b{color:var(--text-bright);}
+.check-row{display:flex;align-items:flex-start;gap:9px;margin-bottom:18px;cursor:pointer;}
+.check-row input{margin-top:2px;flex:none;width:15px;height:15px;accent-color:var(--accent);}
+.check-row .check-label{font-size:12px;color:var(--text);line-height:1.5;}
+.check-row .check-label b{color:var(--text-bright);}
+.btn-primary{width:100%;background:var(--accent);color:#000;border:none;padding:13px;font-family:var(--mono);
+  font-size:12px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;cursor:pointer;}
+.btn-primary:hover{filter:brightness(1.08);}
+.pathway-row{display:flex;gap:8px;margin-top:12px;}
+.pathway-row select{flex:1;background:var(--surface2);border:1px solid var(--border);color:var(--text-bright);
+  font-family:var(--mono);font-size:10.5px;padding:8px 9px;}
+.pathway-row button{flex:none;background:transparent;color:var(--text-dim);border:1px solid var(--border);
+  font-family:var(--mono);font-size:10px;letter-spacing:0.04em;text-transform:uppercase;padding:8px 12px;cursor:pointer;}
+.pathway-row button:hover{color:var(--text-bright);border-color:var(--border-light);}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo"><div class="logo-square">S</div><div class="logo-text">SAFE</div></div>
+  <h1>Set up this demo</h1>
+  <div class="sub">This page configures the applicant-facing pathway. Analysis mode is controlled by the server that hosts this demo.</div>
+  <div class="notice"><b>Server-side credentials only.</b> Vendor API keys are never entered, stored, or sent by this browser. Configure Live Mode in the host's <code>config/application.properties</code> file, then restart the service. Without a configured provider key, the demo uses Mock Mode and every outcome remains <b>NEEDS_REVIEW</b>.</div>
+  <label class="check-row" for="chk-allow-other">
+    <input type="checkbox" id="chk-allow-other" checked>
+    <span class="check-label"><b>Allow “Other ID Document”</b> as a submission option in the interview (for example, tribal ID cards or international documents with no standard format).</span>
+  </label>
+  <button class="btn-primary" onclick="startDemo()">Continue →</button>
+  <div class="pathway-row">
+    <select id="test-pathway">
+      <option value="safe_idv_capture_v70.html">Driver's License / State ID Card</option>
+      <option value="safe_idv_capture_passport_v70.html">Passport</option>
+      <option value="safe_idv_capture_passport_card_v70.html">U.S. Passport Card</option>
+      <option value="safe_idv_capture_other_v70.html">Other ID Document</option>
+    </select>
+    <button onclick="goToTestPathway()">Test →</button>
+  </div>
+</div>
+<script>
+"use strict";
+const ALLOW_OTHER_STORAGE_KEY = 'SAFE_ALLOW_OTHER_V1';
+function goToTestPathway(){
+  const sel = document.getElementById('test-pathway');
+  if (sel && sel.value) window.location.href = sel.value;
+}
+function startDemo() {
+  try {
+    sessionStorage.setItem(ALLOW_OTHER_STORAGE_KEY,
+      JSON.stringify(document.getElementById('chk-allow-other').checked));
+  } catch (e) {
+    // If session storage is unavailable, the applicant flow retains its
+    // permissive default for this optional pathway.
+  }
+  window.location.href = 'safe_idv_launch_v70.html';
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,39 @@
+# IDE / Editor configuration
+.idea/
+*.iml
+.vscode/
+*.ipr
+*.iws
+.project
+.classpath
+.settings/
+
+# Generated runtime reports (keep folder with .gitkeep)
+reports/*
+!reports/.gitkeep
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+.env
+venv/
+.venv/
+env/
+ENV/
+
+# Build & compiled output
+target/
+build/
+.gradle/
+*.class.bak
+
+# Logs
+*.log
+logs/
+
+# OS specific files
+.DS_Store
+Thumbs.db
+Desktop.ini

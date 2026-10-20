@@ -1,0 +1,3519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>SAFE Document Autocapture — Passport Card</title>
+<!--
+  SAFE IDV — Standalone Document Autocapture Component (US PASSPORT CARD)
+  ========================================================================
+  v68.15.2: branched from safe_idv_capture_v70.html (the DL/state-ID
+  track) rather than from the passport BOOKLET track
+  (safe_idv_capture_passport_v70.html). This was a deliberate
+  architecture call, not a naming coincidence: the US passport CARD (a
+  physically distinct ID-1/credit-card-sized document from the passport
+  BOOKLET -- see the DOC_TYPE_OPTIONS entry in safe_idv_launch_*.html)
+  is a single rigid card with front/back/tilt like a DL, not a bound
+  book needing an opening gesture. Concretely, this file keeps the DL
+  file's front -> tilt/OVI -> back -> barcode -> finish skeleton, its
+  device/quality-gate/burst/tilt-video machinery entirely as-is, and
+  only retargets the barcode step from PDF417 to CODE 39 (the format on
+  a passport card's back) and adds a best-effort MRZ (TD1, back of card)
+  OCR side-channel during the back step -- see the "MRZ (TD1) — PASSPORT
+  CARD" section below, ported from the booklet file's already-built and
+  spec-verified TD1 parser/check-digit code.
+
+  Front/back ID live capture only. Face liveness is a separate component
+  and out of scope here.
+
+  DELIVERY MODEL
+  --------------
+  Self-contained single HTML file. Drop into the app bundle's Resources/
+  folder next to safe_intake_v6.html / safe_capture_13.html; mock_server.py's
+  serve_static() serves any file in that folder, so this is immediately
+  reachable at  http://localhost:8080/safe_autocapture.html  and tunneled by
+  ngrok exactly like the other pages. No server change needed to host/test it.
+
+  Iterate by editing this file and refreshing the browser — no app rebuild.
+
+  CORE BEHAVIORAL RULE (from the spec — this drives everything)
+  -------------------------------------------------------------
+  Two classes of problem get two different treatments:
+   - CAPTURE-QUALITY problems (blur, glare, framing, distance, obstruction,
+     barcode-not-decodable) get real-time, specific, actionable feedback so a
+     legitimate user can course-correct. Never let someone submit an image the
+     engine was never going to be able to use.
+   - CONTENT/INTEGRITY concerns (moiré/screen recapture, bezel, virtual-camera)
+     are NEVER surfaced in real time. If the frame is technically usable, accept
+     it silently and let the signals flow into the backend payload. Telling
+     someone what looked wrong only teaches them what to fix next attempt.
+  => Category 1 functions drive the on-screen chips. Category 2 functions are
+     computed every frame and stashed in the silent payload; they NEVER touch
+     the user-facing UI. (They are visible in the DEBUG overlay only, which is a
+     testing affordance that does not exist in production.)
+
+  WHAT COULD NOT BE VERIFIED HERE (same discipline as the app's README)
+  --------------------------------------------------------------------
+  This file was authored in a sandbox with no camera and no browser, so no
+  camera-driven behavior could be exercised end-to-end. The pure analysis math
+  (Laplacian variance, exposure/contrast stats, edge sampling, skin-tone ratio,
+  1D FFT / moiré peak) was unit-tested in isolation (see the companion node
+  test). Everything downstream of getUserMedia — real thresholds under real
+  lighting, environment-camera behavior, ZXing PDF417 decode off a live frame —
+  needs on-device testing. The DEBUG overlay exists precisely so a gate that
+  won't clear on your phone is diagnosable at a glance, not another guessing
+  round.
+
+  BOUNDARY / DISTANCE / SKEW — DESIGN CHOICE, FLAGGED
+  ---------------------------------------------------
+  Boundary detection here is ALIGNMENT-GUIDE based: an on-screen card-shaped
+  frame at the ~1.586 ID aspect ratio, with edge-strength sampling along the
+  guide borders confirming a real document edge sits where the guide is. This
+  is how production ID-capture SDKs (Onfido, Jumio, etc.) actually work, and it
+  is robust and testable. The spec's "free-floating quad/corner detection" is
+  the upgrade path — it needs OpenCV.js contour detection (hook marked below).
+  I chose the guide approach for v1 rather than ship fragile blind quad
+  detection I can't test against a camera. Swap in OpenCV.js when you want
+  guide-free capture.
+-->
+<!--
+  ═══════════════════════════════════════════════════════════════════════
+  SIGNAL SEMANTICS — READ BEFORE TOUCHING ANY captureSignals FIELD
+  ═══════════════════════════════════════════════════════════════════════
+  Several metric NAMES describe what they were intended to detect, not what
+  they actually measure. The names are deliberately left unchanged for now
+  (renaming before the integration target is known would just mean renaming
+  twice). This block is the authority on what each field means.
+
+  Validated against TWO matched, controlled A/B rounds — genuine capture vs
+  photographing the same ID off a MacBook Retina screen, identical posture,
+  lighting, distance and hands, laptop fixed while the phone moved.
+
+  ── WORKS: the two real detectors ──────────────────────────────────────
+  bezelScore (FRONT)          genuine 11.5 / 9.0   vs screen 24.5 / 28.3
+                              >=2.1x, no overlap. BEST SIGNAL IN THE BUILD.
+                              Measures mean edge energy in a band just OUTSIDE
+                              the detected card. Works because a palm is a
+                              smooth backdrop while a screen surrounds the card
+                              with window chrome and toolbars. NOTE: it only
+                              separates under STANDARDISED POSTURE — under
+                              uncontrolled backgrounds it was indistinguishable
+                              and had been written off as dead.
+  sharpnessVariance (FRONT)   genuine 213 / 44,867 vs screen 1.17M / 1.24M
+                              ~26x, no overlap. Frame-to-frame variance of the
+                              Laplacian across the burst. Physical basis: the
+                              camera's rolling shutter beats against the panel
+                              refresh rate. PREFER THIS over sharpnessCoV — the
+                              normalisation in CoV threw the signal away (CoV is
+                              only ~1.6x and swings 13x between genuine runs on
+                              posture alone).
+
+  ── DIRECTIONALLY RIGHT BUT THIN (both rounds, small gaps) ─────────────
+  specularFracRange 2.8x · saturationRange 1.8x · bandingPeak(front) 1.2-1.6x
+  bezelScore(back) ~1.2-2x
+
+  ── MEASURED BUT NOT DISCRIMINATING (kept, do NOT "fix" them) ──────────
+  hueDispersion      Reads ~0.001-0.003 on BOTH genuine and screen — it is at
+                     the floor, not broken code. Cause: hue is averaged over the
+                     WHOLE card, so the bulk card colour swamps the small
+                     localised OVI/hologram region. A per-sub-region max-shift
+                     rebuild is the untried fix. It is NOT evidence of anything
+                     at present.
+  moireScoreFullRes  Interleaves between genuine and screen; inverted on the
+                     back. Failed for a PHYSICAL reason: a ~220 PPI Retina pixel
+                     grid falls below the camera's resolving power at normal
+                     distance, so there is no interference pattern to detect.
+                     That same reasoning predicts it SHOULD fire against a
+                     coarser display (budget 1080p monitor, older laptop) —
+                     untested. Do not delete on Retina evidence alone.
+  distinctFrameRatio Noise across rounds (genuine front 1 / back 0.5; screen
+                     front 0.5 / back 1). Also confounded: a well-braced genuine
+                     capture is so still that burst frames become byte-identical,
+                     producing a static-replay signature. NEVER threshold near 1.
+  aspectSpan,        Reported as DATA, never as fraud signals. Geometric
+  widthFracSpan      foreshortening can never discriminate: a phone moved around
+                     a fixed screen foreshortens the displayed card with
+                     identical projection maths to a real card. widthFrac is also
+                     confounded by distance. They exist only to describe how much
+                     the view varied.
+
+  ── MISNAMED — THE ONE ACTIVE HAZARD ───────────────────────────────────
+  screenFurnitureLines   IT IS RELIABLY INVERTED. Genuine 14/13 and 5/32 vs
+                         screen 3/0 and 4/2. It counts strong straight lines
+                         outside the card, which in practice means BACKGROUND
+                         CLUTTER (a couch seam, a forearm), not screens — a
+                         screen recapture fills the frame and scores LOW. Any
+                         consumer reading "high = screen" will flag legitimate
+                         users. Treat as background complexity / context only.
+                         Rename to backgroundComplexity at integration.
+
+  ── WHY DEAD METRICS ARE STILL SHIPPED ─────────────────────────────────
+  bezelScore was declared dead under uncontrolled backgrounds and is now the
+  single best detector — deleting on early confidence would have destroyed it.
+  n is only 2 matched rounds, one phone, one room, one Retina panel. KILL
+  CRITERION: a metric is removed only after it fails to separate across >=5
+  matched pairs spanning >=2 display types. Only real cost of keeping them is
+  CPU (full-res moiré is the expensive per-frame computation) — gate it behind a
+  flag before deleting it.
+
+  ── CAPTURE POSTURE IS PART OF THE SIGNAL, NOT JUST UX ─────────────────
+  Card flat on an OPEN PALM, forearm braced, phone in the other hand. This is
+  what makes bezelScore work at all, and standardising it narrows the legitimate
+  distribution — which is what makes backend thresholding feasible. Thresholds
+  themselves belong to the BACKEND, which has submission volume; do not set them
+  client-side.
+  ═══════════════════════════════════════════════════════════════════════
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<!-- ZXing JS port — client-side PDF417 decode off the live back-image feed.
+     Matches the spec's stated @zxing/library choice. Loaded from CDN, the same
+     pattern the capture page uses for its TF.js BlazeFace/FaceMesh models. -->
+<script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
+<style>
+:root{
+  --bg:#0F1219; --surface:#1A2233; --surface2:#212D42;
+  --border:#2A3A52; --border-light:#374d6b;
+  --text:#C8D6E8; --text-dim:#7A90AA; --text-bright:#E8F0F8;
+  --accent:#E8A020; --accent-dim:rgba(232,160,32,0.15); --accent-border:rgba(232,160,32,0.4);
+  --cyan:#43B5C6;
+  --green:#3DB87A; --green-dim:rgba(61,184,122,0.12);
+  --red:#E85555; --red-dim:rgba(232,85,85,0.12);
+  --amber2:#E8A020;
+  --mono:'JetBrains Mono','Fira Code','Consolas',monospace;
+  --sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{height:100%;}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13.5px;
+  -webkit-font-smoothing:antialiased;overflow:hidden;}
+
+/* Header */
+#hdr{background:var(--surface);border-bottom:1px solid var(--border);height:48px;
+  display:flex;align-items:center;gap:12px;padding:0 16px;position:relative;z-index:30;}
+.logo-square{width:26px;height:26px;background:var(--accent);display:flex;align-items:center;
+  justify-content:center;font-family:var(--mono);font-size:10px;font-weight:700;color:#000;}
+.logo-text{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--text-bright);letter-spacing:0.08em;}
+.logo-sub{font-size:9px;color:var(--text-dim);font-family:var(--mono);}
+.hdr-spacer{flex:1;}
+.hdr-badge{font-family:var(--mono);font-size:9px;color:var(--text-dim);padding:3px 8px;
+  border:1px solid var(--border);background:var(--bg);letter-spacing:0.06em;}
+#debug-toggle{font-family:var(--mono);font-size:9px;letter-spacing:0.06em;color:var(--text-dim);
+  border:1px solid var(--border);background:var(--bg);padding:4px 9px;cursor:pointer;text-transform:uppercase;}
+#debug-toggle.on{color:var(--accent);border-color:var(--accent-border);background:var(--accent-dim);}
+/* v67 internal testing build: Debug toggle and log badge are intentionally
+   VISIBLE here (unlike the polished client-facing build this file was
+   copied from) so real capture attempts can be inspected directly --
+   this build exists specifically to gather back-of-ID framing diagnostics.
+   See #debug-toggle button below and buildDiagnostics()/dbg-copy. */
+
+/* Stage */
+#stage{position:absolute;top:48px;left:0;right:0;bottom:0;overflow:hidden;}
+.screen{position:absolute;inset:0;display:none;flex-direction:column;}
+.screen.active{display:flex;}
+
+/* Intro */
+#screen-intro{align-items:center;justify-content:center;padding:24px;text-align:center;overflow-y:auto;}
+.intro-wrap{max-width:440px;width:100%;}
+.intro-title{font-family:var(--mono);font-size:20px;font-weight:700;color:var(--text-bright);margin-bottom:10px;}
+.intro-sub{color:var(--text-dim);font-size:13px;line-height:1.6;margin-bottom:24px;}
+.intro-steps{text-align:left;margin-bottom:24px;display:flex;flex-direction:column;gap:8px;}
+.istep{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--cyan);
+  padding:11px 14px;display:flex;gap:11px;align-items:flex-start;}
+.istep-n{font-family:var(--mono);font-size:15px;font-weight:700;color:var(--cyan);min-width:20px;}
+.istep-t{font-size:12px;color:var(--text);line-height:1.45;}
+.dev-row{display:flex;gap:8px;align-items:center;justify-content:center;margin-bottom:16px;flex-wrap:wrap;}
+.dev-row label{font-family:var(--mono);font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.06em;}
+select,.mini-input{background:var(--surface2);border:1px solid var(--border);color:var(--text-bright);
+  font-family:var(--mono);font-size:11px;padding:7px 9px;}
+.btn-primary{background:var(--accent);color:#000;border:none;padding:13px 40px;font-family:var(--mono);
+  font-size:12px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;cursor:pointer;
+  transition:filter 0.15s;width:100%;}
+.btn-primary:hover{filter:brightness(1.08);}
+.btn-primary:disabled{opacity:0.5;cursor:not-allowed;}
+.btn-ghost{background:transparent;color:var(--cyan);border:1px solid var(--cyan);padding:10px 22px;
+  font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;cursor:pointer;}
+.err-note{color:var(--red);font-family:var(--mono);font-size:11px;margin-top:14px;line-height:1.5;min-height:16px;}
+
+/* Capture */
+#screen-capture{background:#000;}
+#cam-area{position:relative;flex:1;overflow:hidden;background:#000;
+  display:flex;align-items:center;justify-content:center;}
+#video{max-width:100%;max-height:100%;display:block;}
+#video.mirror{transform:scaleX(-1);}
+/* sized+positioned by layoutOverlay() to exactly cover the video content rect */
+#overlay{position:absolute;left:0;top:0;pointer-events:none;}
+/* Overlay must mirror in lockstep with #video (front camera only) — otherwise
+   the guide box stays put while the video flips underneath it, so they no
+   longer agree on-screen. All guide-drawing math below stays in normal
+   (un-mirrored) coordinates; this is a pure display-layer flip, exactly like
+   #video's — see startCamera()'s mirror-toggle comment. */
+#overlay.mirror{transform:scaleX(-1);}
+/* top prompt bar */
+#prompt-bar{position:absolute;top:0;left:0;right:0;padding:14px 16px;
+  background:linear-gradient(to bottom,rgba(15,18,25,0.92),rgba(15,18,25,0));z-index:5;text-align:center;}
+#prompt-side{font-family:var(--mono);font-size:10px;letter-spacing:0.14em;text-transform:uppercase;
+  color:var(--accent);margin-bottom:3px;}
+#prompt-main{font-family:var(--mono);font-size:15px;font-weight:700;color:#fff;}
+/* live guidance (the single most important actionable message) */
+#guidance{position:absolute;left:50%;transform:translateX(-50%);bottom:118px;z-index:6;
+  font-family:var(--mono);font-size:13px;font-weight:700;padding:8px 16px;border-radius:2px;
+  background:rgba(232,85,85,0.92);color:#fff;white-space:nowrap;transition:background 0.2s;
+  box-shadow:0 2px 12px rgba(0,0,0,0.4);}
+#guidance.ok{background:rgba(61,184,122,0.94);}
+/* gate chips */
+#chips{position:absolute;left:0;right:0;bottom:0;z-index:5;padding:14px 12px 18px;
+  background:linear-gradient(to top,rgba(15,18,25,0.95),rgba(15,18,25,0));
+  display:flex;gap:6px;flex-wrap:wrap;justify-content:center;}
+.chip{font-family:var(--mono);font-size:9px;letter-spacing:0.04em;text-transform:uppercase;
+  padding:4px 8px;border:1px solid var(--border);color:var(--text-dim);background:rgba(26,34,51,0.7);
+  border-radius:2px;transition:all 0.15s;white-space:nowrap;}
+.chip.pass{color:var(--green);border-color:rgba(61,184,122,0.4);background:var(--green-dim);}
+.chip.fail{color:var(--red);border-color:rgba(232,85,85,0.35);background:var(--red-dim);}
+.chip.na{opacity:0.45;}
+/* capture flash */
+#flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none;z-index:10;}
+#flash.fire{animation:flash 0.4s ease-out;}
+@keyframes flash{0%{opacity:0.85;}100%{opacity:0;}}
+
+/* Debug overlay */
+#debug{position:absolute;top:52px;right:8px;width:230px;max-height:calc(100% - 130px);z-index:20;
+  background:rgba(10,13,20,0.93);border:1px solid var(--border-light);font-family:var(--mono);
+  font-size:10px;padding:10px;overflow-y:auto;display:none;}
+#debug.show{display:block;}
+#debug h4{font-size:9px;letter-spacing:0.1em;text-transform:uppercase;color:var(--accent);
+  margin-bottom:6px;border-bottom:1px solid var(--border);padding-bottom:4px;}
+#debug h4.cat2{color:var(--cyan);margin-top:10px;}
+.dbg-row{display:flex;justify-content:space-between;gap:8px;padding:1.5px 0;}
+.dbg-k{color:var(--text-dim);}
+.dbg-v{color:var(--text-bright);}
+.dbg-v.pass{color:var(--green);}
+.dbg-v.fail{color:var(--red);}
+.dbg-note{color:var(--text-dim);font-size:8.5px;line-height:1.4;margin-top:6px;font-style:italic;}
+
+/* ── Non-textual instruction graphics (work without reading English) ── */
+#howto{display:flex;align-items:center;gap:14px;background:var(--surface);border:1px solid var(--border);
+  border-left:3px solid var(--accent);padding:12px 14px;margin-bottom:14px;}
+#howto svg{width:96px;height:72px;flex:none;}
+#howto .cap{font-size:11.5px;color:var(--text);line-height:1.45;text-align:left;}
+#howto .cap b{color:var(--text-bright);font-family:var(--mono);font-size:10px;letter-spacing:0.06em;
+  text-transform:uppercase;display:block;margin-bottom:3px;}
+.gfx-hand{fill:none;stroke:var(--text-dim);stroke-width:2.4;stroke-linejoin:round;}
+.gfx-card{fill:rgba(232,160,32,0.16);stroke:var(--accent);stroke-width:2.2;}
+.gfx-line{stroke:rgba(200,214,232,0.5);stroke-width:1.6;stroke-linecap:round;}
+.gfx-brace{stroke:var(--cyan);stroke-width:2.4;stroke-linecap:round;}
+.gfx-arc{fill:none;stroke:var(--cyan);stroke-width:2;stroke-linecap:round;}
+.gfx-head{fill:var(--cyan);}
+
+/* animated tilt demo, shown only during the tilt step */
+#tilt-demo{position:absolute;top:76px;left:50%;transform:translateX(-50%);z-index:6;
+  background:rgba(15,18,25,0.82);border:1px solid var(--border-light);padding:6px 10px;
+  display:none;align-items:center;gap:9px;}
+#tilt-demo.show{display:flex;animation:tdfade 0.4s ease-out;}
+#tilt-demo svg{width:104px;height:56px;}
+#tilt-demo .tdcap{font-family:var(--mono);font-size:9px;letter-spacing:0.05em;color:var(--text);
+  text-transform:uppercase;max-width:96px;line-height:1.35;}
+@keyframes tdfade{from{opacity:0}to{opacity:1}}
+.td-card{transform-box:fill-box;transform-origin:center;animation:tdrock 2.6s ease-in-out infinite;}
+@keyframes tdrock{0%,100%{transform:scaleX(0.60) skewY(4deg);}50%{transform:scaleX(1) skewY(-4deg);}}
+.td-sheen{fill:rgba(255,255,255,0.85);animation:tdsweep 2.6s ease-in-out infinite;}
+@keyframes tdsweep{0%,100%{transform:translateX(0);opacity:0.18;}50%{transform:translateX(58px);opacity:0.8;}}
+#dbg-controls{margin-top:8px;border-top:1px solid var(--border);padding-top:8px;}
+#dbg-copy{width:100%;font-family:var(--mono);font-size:10px;letter-spacing:0.06em;text-transform:uppercase;
+  color:var(--accent);border:1px solid var(--accent-border);background:var(--accent-dim);padding:7px;cursor:pointer;}
+#dbg-copy-status{font-family:var(--mono);font-size:8.5px;color:var(--green);margin-top:5px;min-height:11px;text-align:center;}
+#log-badge{position:absolute;top:56px;left:8px;z-index:20;font-family:var(--mono);font-size:9px;
+  letter-spacing:0.06em;color:var(--red);border:1px solid rgba(232,85,85,0.4);background:rgba(232,85,85,0.12);
+  padding:4px 8px;cursor:pointer;display:none;}
+#log-badge.on{display:block;}
+
+/* Result */
+#screen-result{padding:20px;overflow-y:auto;align-items:center;}
+.result-wrap{max-width:460px;width:100%;}
+.result-title{font-family:var(--mono);font-size:16px;font-weight:700;color:var(--green);
+  margin-bottom:4px;text-align:center;}
+.result-sub{color:var(--text-dim);font-size:12px;text-align:center;margin-bottom:20px;}
+.shots{display:flex;gap:12px;margin-bottom:18px;}
+.shot{flex:1;}
+.shot-lbl{font-family:var(--mono);font-size:9px;letter-spacing:0.08em;text-transform:uppercase;
+  color:var(--text-dim);margin-bottom:5px;}
+.shot img{width:100%;border:1px solid var(--border);display:block;}
+.payload-box{background:#0A0D14;border:1px solid var(--border);padding:12px;font-family:var(--mono);
+  font-size:10px;color:var(--text);white-space:pre-wrap;word-break:break-word;max-height:280px;
+  overflow-y:auto;margin-bottom:8px;line-height:1.5;}
+.payload-lbl{font-family:var(--mono);font-size:9px;letter-spacing:0.08em;text-transform:uppercase;
+  color:var(--text-dim);margin-bottom:6px;display:flex;justify-content:space-between;}
+.result-actions{display:flex;gap:10px;margin-top:14px;}
+.result-actions button{flex:1;}
+.silent-tag{color:var(--cyan);font-size:9px;}
+</style>
+</head>
+<body>
+
+<div id="hdr">
+  <div class="logo-square">S</div>
+  <div>
+    <div class="logo-text">SAFE</div>
+    <div class="logo-sub">DOCUMENT AUTOCAPTURE</div>
+  </div>
+  <div class="hdr-spacer"></div>
+  <!-- v67 internal testing build: Debug toggle is live and clickable --
+       opens the on-screen metrics/gates overlay and rolling diagnostics
+       log (see renderDebug()/buildDiagnostics()) so real-device back-of-ID
+       capture attempts can be read directly off the screen. -->
+  <button id="debug-toggle">Debug</button>
+</div>
+
+<div id="stage">
+
+  <!-- INTRO -->
+  <div class="screen active" id="screen-intro">
+    <div class="intro-wrap">
+      <div class="intro-title">Scan your ID</div>
+      <div class="intro-sub">Hold your ID document steady inside the frame. The camera captures automatically once the image is sharp, level, and fully in view — there's no shutter button to press.</div>
+      <div id="howto">
+        <svg viewBox="0 0 150 118" aria-label="Hold the ID flat on your open palm, forearm resting on a surface">
+          <!-- fingers -->
+          <rect class="gfx-hand" x="57" y="16" width="10" height="34" rx="5"/>
+          <rect class="gfx-hand" x="70" y="10" width="10" height="40" rx="5"/>
+          <rect class="gfx-hand" x="83" y="12" width="10" height="38" rx="5"/>
+          <rect class="gfx-hand" x="96" y="20" width="10" height="30" rx="5"/>
+          <!-- thumb -->
+          <rect class="gfx-hand" x="40" y="44" width="10" height="26" rx="5" transform="rotate(-34 45 57)"/>
+          <!-- palm -->
+          <rect class="gfx-hand" x="53" y="44" width="56" height="44" rx="13"/>
+          <!-- ID resting on the palm -->
+          <rect class="gfx-card" x="49" y="50" width="64" height="40" rx="4"/>
+          <line class="gfx-line" x1="56" y1="60" x2="76" y2="60"/>
+          <line class="gfx-line" x1="56" y1="69" x2="90" y2="69"/>
+          <line class="gfx-line" x1="56" y1="78" x2="82" y2="78"/>
+          <!-- forearm down to a braced surface -->
+          <path class="gfx-hand" d="M68 88 L68 104 M94 88 L94 104"/>
+          <line class="gfx-brace" x1="26" y1="106" x2="128" y2="106"/>
+        </svg>
+        <div class="cap"><b>Hold it like this</b>ID flat on your open palm, fingers on the edges only. Rest your forearm on something steady.</div>
+      </div>
+      <div class="intro-steps">
+        <div class="istep"><div class="istep-n">1</div><div class="istep-t">Front of the ID first, then you'll be prompted to flip it over.</div></div>
+        <div class="istep"><div class="istep-n">2</div><div class="istep-t">Fill the frame, hold level, avoid glare from overhead light.</div></div>
+        <div class="istep"><div class="istep-n">3</div><div class="istep-t">The back's barcode is read on-device — hold until the reticle turns green.</div></div>
+      </div>
+      <div class="dev-row">
+        <label for="cam-select">Camera</label>
+        <select id="cam-select"><option value="">Default (rear preferred)</option></select>
+      </div>
+      <button class="btn-primary" id="btn-start">Enable camera &amp; begin</button>
+      <div class="err-note" id="intro-err"></div>
+    </div>
+  </div>
+
+  <!-- CAPTURE -->
+  <div class="screen" id="screen-capture">
+    <div id="cam-area">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+      <div id="prompt-bar">
+        <div id="prompt-side">FRONT OF ID</div>
+        <div id="prompt-main">Position your ID in the frame</div>
+      </div>
+      <div id="guidance">Move ID into the frame</div>
+      <div id="chips"></div>
+      <div id="tilt-demo">
+        <svg viewBox="0 0 130 62" aria-label="Rock the card until the sheen sweeps across it">
+          <defs><clipPath id="tdclip"><rect x="30" y="12" width="70" height="38" rx="4"/></clipPath></defs>
+          <g class="td-card">
+            <rect class="gfx-card" x="30" y="12" width="70" height="38" rx="4"/>
+            <g clip-path="url(#tdclip)"><rect class="td-sheen" x="18" y="12" width="14" height="38"/></g>
+          </g>
+          <path class="gfx-arc" d="M16 56 Q65 40 114 56"/>
+          <path class="gfx-head" d="M12 50 l9 3 l-4 7 z"/>
+          <path class="gfx-head" d="M118 50 l-9 3 l4 7 z"/>
+        </svg>
+        <div class="tdcap">Rock until the sheen sweeps</div>
+      </div>
+      <div id="flash"></div>
+    </div>
+    <div id="debug">
+      <h4>Capture-quality gates</h4>
+      <div id="debug-cat1"></div>
+      <h4 class="cat2">Silent integrity signals</h4>
+      <div id="debug-cat2"></div>
+      <div class="dbg-note">Silent signals are never shown to the user in production — this overlay is a testing affordance only.</div>
+      <div id="dbg-controls">
+        <button id="dbg-copy">Copy diagnostics</button>
+        <div id="dbg-copy-status"></div>
+      </div>
+    </div>
+    <!-- floating capture-log toggle so it's reachable even with debug panel closed -->
+    <button id="log-badge" title="frames logged">REC 0</button>
+  </div>
+
+  <!-- RESULT -->
+  <div class="screen" id="screen-result">
+    <div class="result-wrap">
+      <div class="result-title">Both sides captured</div>
+      <div class="result-sub">Best frames selected from the capture bursts.</div>
+      <div class="shots">
+        <div class="shot"><div class="shot-lbl">Front</div><img id="shot-front" alt="front"></div>
+        <div class="shot"><div class="shot-lbl">Back</div><img id="shot-back" alt="back"></div>
+        <div class="shot" id="shot-barcode-wrap"><div class="shot-lbl">Barcode</div><img id="shot-barcode" alt="barcode"></div>
+      </div>
+      <div class="payload-lbl"><span>Signal payload <span class="silent-tag">(rides into /cases body as captureSignals)</span></span></div>
+      <div class="payload-box" id="payload-json"></div>
+      <div class="result-actions">
+        <button class="btn-ghost" id="btn-restart">Recapture</button>
+        <button class="btn-primary" id="btn-copy" style="width:auto;">Copy payload</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+"use strict";
+const BUILD_VERSION = 'v68.15.3';
+// Barcode-step guide, as fractions of the CARD rectangle (cardRect(), not the
+// raw camera frame — see cardRect()'s comment for why: a fraction-of-frame box
+// changes shape across devices whenever the video's own aspect ratio differs
+// from what this was tuned against, which is exactly what "barcode guide isn't
+// right sized on laptop" turned out to be).
+//
+// Recalibrated again after real-device testing showed the box shape (previously
+// ~9.8:1 width:height) didn't match the actual PDF417's proportions on a real
+// license — too flat/wide relative to how tall the real symbol actually is.
+// Widened toward the card's full width (real AAMVA PDF417 barcodes are usually
+// printed close to edge-to-edge) and made noticeably taller, landing near a
+// 4:1 box instead. This is still an aim-assist, not a precision crop — the
+// actual decode region (cropGuideRegion()) pads generously beyond it — but the
+// box itself should now track a real symbol's shape much more closely.
+// Still a real-device-tunable value like everything else in this file: if it's
+// still off, nudge these four fractions rather than the surrounding logic.
+const BARCODE_GUIDE = {fx0:0.07, fy0:0.33, fx1:0.93, fy1:0.67};
+// Step 4 must EXIT rather than trap the user: an unreadable barcode is EVIDENCE
+// a reviewer needs (worn card, counterfeit, or second-generation screen imagery
+// that lost fine detail), so it is captured, submitted, and flagged — which also
+// protects the customer's credit by telling the backend not to attempt an
+// authority lookup it cannot complete. 25s is long enough that any decodable
+// barcode wins; a barcode that fails for 25s will not succeed at 60s.
+const BARCODE_MAX_MS = 25000;
+// Grace period after entering the barcode step before the first decode
+// attempt fires. Without this, the very first tick of barcodeStepTick()
+// (state.lastBarcode starts at 0) passes the 150ms rate-limit instantly and
+// grabs whatever's in frame mid-repositioning, right after the flip prompt —
+// there was no window to actually move the card into the guide box first.
+const BARCODE_SETTLE_MS = 1600;
+const BARCODE_TIPS = ['Fill the guide with the barcode','Hold steady','Tilt slightly to cut glare','Move a little closer'];
+const BACK_FLIP_HOLD_MS = 1800;
+// Coverage is TIME + SUSTAINED CHANGE, deliberately not a geometric angle.
+// There is no clean angle measurement available: aspectSpan proved to be
+// detection jitter (0.574 genuine vs 0.536 screen — no separation, and the step
+// completed without the card being tilted at all), and widthFrac is confounded
+// by distance (moving the phone closer grows it without any tilt). Isolating
+// tilt from distance needs the width:height ratio, i.e. the aspect we know is
+// unreliable. So this gate only certifies "the user genuinely worked the card
+// for several seconds", which is what makes the PHOTOMETRIC metrics meaningful.
+// Geometry could never have been a fraud signal anyway: a phone moved around a
+// fixed screen foreshortens the displayed card with identical projection maths.
+const TILT = { minSamples:12, minDurationMs:4500, minMeanDelta:0.8, maxMs:16000, sampleEveryMs:170 };   // ignore captures briefly after entering the back step (during the flip)
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 0 — CONFIG / THRESHOLDS
+   Every gate threshold lives here so it can be tuned on-device without
+   hunting through the logic. These starting values are reasoned defaults;
+   they WILL need calibration against real camera output under real lighting
+   (that calibration is exactly what can't be done in a cameraless sandbox).
+   ════════════════════════════════════════════════════════════════════════ */
+const CONFIG = {
+  analysisWidth: 480,          // downscale frames to this width for CV (perf)
+  aspectRatio: 1.586,          // ID-1 (ISO/IEC 7810) — driver's licence / ID card
+  aspectTolerance: 0.18,       // how far the on-frame guide may deviate (informational)
+  guideFillFrac: 0.82,         // guide width as fraction of the shorter analysis dimension
+  gates: {
+    sharpnessMin: 90,          // Laplacian variance floor (blur gate)
+    glareMaxFrac: 0.020,       // max fraction of blown-out (>245) pixels
+    underExpMaxFrac: 0.35,     // max fraction of near-black (<25) pixels
+    meanLumaMin: 60,           // frame too dark below this mean luma
+    meanLumaMax: 220,          // frame too bright above this mean luma
+    contrastMinStd: 32,        // min luma std-dev (washed-out gate)
+    // ── detection-based framing (v3): gates evaluate the DETECTED card box ──
+    // BACK is deliberately framed WIDER than the front. The back image no
+    // longer needs to carry the barcode (that has its own dedicated full-res
+    // step), so the freed framing budget buys BACKGROUND CONTEXT — which is
+    // what finally makes enclosing-rectangle (bezel) detection possible.
+    backDistWidthMin: 0.30,
+    backDistWidthMax: 0.78,   // 0.65 blocked real captures (users hold at ~0.75); still leaves ~22% margin for background context
+    distWidthMin: 0.50,        // detected card width as fraction of frame width
+    distWidthMax: 0.97,        //   ... in-band = right distance
+    inFrameMargin: 0.015,      // card must sit >= this in from every frame edge
+    aspectMin: 1.15,           // detected box aspect (perspective-tolerant band)
+    aspectMax: 2.05,           //   ID-1 is 1.586; wide band absorbs tilt/crop
+    // Card-vs-background brightness separation (luma). Below WARN = treat as an
+    // empty frame; between WARN and MIN = a region is there but too close in
+    // brightness to trust -> show the low-contrast warning; >= MIN = detected.
+    sepConfident: 30,
+    sepWarn: 12,
+    edgePresenceMin: 0.42,     // min fraction of guide-border bands showing a real edge
+    skewMaxDeg: 9,             // max card rotation before "straighten"
+    fillMinFrac: 0.42,         // card must occupy >= this share of the guide area
+    fillMaxFrac: 1.10,         // ... and not overflow the guide (too close / cropping)
+    // Obstruction is now sampled in a CENTRE patch only (see evaluateFrame) to
+    // dodge the printed ID photo and the edges where fingers legitimately grip.
+    // A finger covering the card's data fields still trips it; the ID photo and
+    // a normal edge grip no longer do. Threshold is generous by design.
+    // ── BACK-SIDE OVERRIDES ───────────────────────────────────────────
+    // Step 3's job is proving a PHYSICAL DOCUMENT EXISTS: whole card in frame
+    // with surrounding context, a barcode-shaped region present, nothing
+    // occluding it. It is NOT a data source — step 4 recovers the AAMVA string
+    // at full resolution. So sharpness, skew, contrast and colour fidelity have
+    // no downstream consumer here, and holding the back to front-grade limits
+    // was what blocked capture in warm, dim light (contrast passed 56% of
+    // frames, colorCast 47%). Boundary, aspect, obstruction, barcode-presence
+    // and the wide framing stay tight, because those ARE the deliverable.
+    backSharpnessMin: 45,
+    backSkewMaxDeg: 20,
+    backContrastMinStd: 20,
+    backColorCastMaxRatio: 3.00,
+    obstructionMaxFrac: 0.30,  // skin-tone fraction that alone is not enough to fail
+    obstructionTextureMax: 11, // ...it must ALSO be smoother than this (fingertip vs print)
+    // Loosened from 0.05 based on two real diagnostics dumps: a session that
+    // DID go on to decode successfully peaked at only 0.0758, and a separate
+    // sharp, well-lit, low-obstruction session (barcodeCropSharp avg 106,
+    // fine on every other gate) still peaked at just 0.06 across 175 frames
+    // -- meaning 0.05 sat right in the middle of normal frame-to-frame noise
+    // for a genuine barcode, not below it. This is a pre-decode sanity
+    // filter ("saves a credit" per this function's own comment above), not
+    // a security gate -- the real decoder still rejects anything that isn't
+    // actually a barcode -- so erring looser here trades a slightly weaker
+    // pre-filter for not blocking real barcodes from ever reaching it.
+    barcodePresenceMin: 0.03,  // min fraction of card rows with barcode-dense edges (back only)
+    // v67: a real 40s diagnostics session never exceeded 0.08 presence score
+    // (avg 0.00, 396 frames) despite good framing/sharpness/separation on every
+    // other gate -- the scan's per-pixel transition threshold (28) and per-row
+    // density threshold (0.22) were "reasoned defaults" (see SECTION 0 header)
+    // never calibrated against compressed/blurred real camera video, where
+    // genuine PDF417 bar edges are softer than in a clean synthetic test image.
+    // Loosened both -- see barcodePresenceScore()/barcodeRegionGeometry() --
+    // needs a retest to confirm real presence scores actually rise; there was
+    // no raw pixel data available to derive an exact replacement number.
+    barcodeEdgeThreshold: 20,      // was 28 (inline) — min luma jump counted as an "edge" pixel
+    barcodeRowDensityMin: 0.16,    // was 0.22 (inline) — min fraction of a row's pixels that must be edges for the row to count as "dense"
+    // Named so buildPayload()'s post-hoc "present_undecodable" vs
+    // "no_barcode_region_found" classification isn't a bare magic number next
+    // to the unrelated live-gate threshold above. Deliberately a HIGHER bar
+    // than barcodePresenceMin: this one asks "is presence strong enough to
+    // confidently REPORT a barcode-shaped region", not "loose enough to let a
+    // marginal frame continue toward the dedicated decode step" -- the two
+    // questions have different costs (a wasted decode attempt vs. a
+    // misleading reviewer-facing claim), so they are allowed to stay different
+    // values on purpose, not a duplication bug.
+    barcodePresenceConfidentMin: 0.08,
+    colorCastMaxRatio: 2.00,  // 1.55 failed 53% of frames under warm evening light (cast avg 1.57)   // max channel-imbalance ratio (tint gate)
+  },
+  stabilityFrames: 6,          // consecutive all-pass frames before we lock a burst
+  burstWindow: 10,             // rolling frames kept for best-frame + replay analysis
+  barcodeThrottleMs: 160,      // min gap between ZXing decode attempts (back side)
+  processEveryMs: 90,          // analysis cadence (~11fps of CV work)
+};
+
+// Known virtual-camera / capture-software substrings (Category 2 device check).
+const VIRTUAL_CAM_NAMES = ['obs','manycam','snap camera','snapcam','xsplit','camtwist',
+  'droidcam','epoccam','ndi','virtual','avatarify','mmhmm','logi capture','streamlabs'];
+
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 1 — PURE ANALYSIS FUNCTIONS
+   Deliberately DOM-free and side-effect-free so they can be unit-tested in
+   node (see safe_autocapture_analysis.test.js). Each takes raw pixel data
+   and returns numbers — no thresholds applied here; gating happens in §4.
+   ════════════════════════════════════════════════════════════════════════ */
+
+// Grayscale (Rec.601 luma) from RGBA Uint8ClampedArray -> Float32Array
+function toGray(rgba, w, h){
+  const g = new Float32Array(w*h);
+  for(let i=0,p=0;i<g.length;i++,p+=4){
+    g[i] = 0.299*rgba[p] + 0.587*rgba[p+1] + 0.114*rgba[p+2];
+  }
+  return g;
+}
+
+// Laplacian variance — objective blur score. Higher = sharper.
+// 3x3 discrete Laplacian kernel, variance of the response over the interior.
+function laplacianVariance(gray, w, h){
+  let sum=0, sumSq=0, n=0;
+  for(let y=1;y<h-1;y++){
+    for(let x=1;x<w-1;x++){
+      const i=y*w+x;
+      const lap = 4*gray[i] - gray[i-1] - gray[i+1] - gray[i-w] - gray[i+w];
+      sum+=lap; sumSq+=lap*lap; n++;
+    }
+  }
+  if(!n) return 0;
+  const mean=sum/n;
+  return sumSq/n - mean*mean;
+}
+
+// Exposure stats: mean luma, fraction blown-out (>=245), fraction near-black (<25).
+function exposureStats(gray){
+  let sum=0, blown=0, dark=0;
+  const n=gray.length;
+  for(let i=0;i<n;i++){
+    const v=gray[i];
+    sum+=v;
+    if(v>=245) blown++;
+    if(v<25) dark++;
+  }
+  return { meanLuma:sum/n, blownFrac:blown/n, darkFrac:dark/n };
+}
+
+// Contrast: std-dev of luma (dynamic range proxy, distinct from blur/exposure).
+function contrastStd(gray){
+  let sum=0,sumSq=0;const n=gray.length;
+  for(let i=0;i<n;i++){sum+=gray[i];sumSq+=gray[i]*gray[i];}
+  const mean=sum/n;
+  return Math.sqrt(Math.max(0,sumSq/n-mean*mean));
+}
+
+// Colour cast: max pairwise channel-mean ratio. ~1.0 = neutral; high = tinted.
+function colorCastRatio(rgba){
+  let r=0,g=0,b=0;const n=rgba.length/4;
+  for(let p=0;p<rgba.length;p+=4){r+=rgba[p];g+=rgba[p+1];b+=rgba[p+2];}
+  r/=n;g/=n;b/=n;
+  const mx=Math.max(r,g,b), mn=Math.min(r,g,b)||1;
+  return mx/mn;
+}
+
+// Skin-tone fraction inside a rectangular region (finger/obstruction proxy).
+// YCbCr skin gate (Cb/Cr ranges are the classic Hsu et al. bounds).
+function skinToneFraction(rgba, w, h, region){
+  const {x0,y0,x1,y1} = region;
+  let skin=0, tot=0;
+  for(let y=y0;y<y1;y++){
+    for(let x=x0;x<x1;x++){
+      const p=(y*w+x)*4;
+      const R=rgba[p],G=rgba[p+1],B=rgba[p+2];
+      const Cb=128 - 0.168736*R - 0.331264*G + 0.5*B;
+      const Cr=128 + 0.5*R - 0.418688*G - 0.081312*B;
+      if(Cb>=77 && Cb<=127 && Cr>=133 && Cr<=173) skin++;
+      tot++;
+    }
+  }
+  return tot? skin/tot : 0;
+}
+
+// Obstruction = skin-toned AND SMOOTH. Colour alone is not enough: the classic
+// YCbCr skin gate (Cb 77-127, Cr 133-173) also catches warm cream, beige, wood
+// and cardboard. A PA licence back is mostly cream, so under warm light
+// (cast ~1.40) the whole card read as "finger" — obstruction 0.77-0.94 against a
+// 0.30 threshold, and the back could never be captured. The disambiguator is
+// TEXTURE: a fingertip is smooth, whereas the card's centre is full of print and
+// barcode detail. A finger that actually occludes the data area destroys that
+// detail, so requiring BOTH conditions detects real occlusion without flagging
+// the document itself. (Safe against blur because the sharpness gate runs first.)
+//
+// v67 TEXTURE FIX: a flat average gradient over the WHOLE centre patch is
+// diluted by whatever blank cream card area the patch happens to include. A
+// real diagnostics session showed skin 0.995-0.998 (worse than the documented
+// 0.77-0.94 bug above) with a huge frame-to-frame texture spread (3 to 77
+// over one 40s session) while every other gate (sharpness, skew, separation)
+// looked clean — far more consistent with the fixed centre patch sometimes
+// landing on real print/barcode detail and sometimes on blank card back than
+// with a finger appearing and disappearing every few hundred ms. Applying the
+// same insight barcodePresenceScore() already uses below ("band-max beats
+// whole-region average" — a barcode band scores near 1.0 while sparse text
+// stays low): split the centre patch into overlapping horizontal strips and
+// report the strip with the MOST texture, not the region's overall average.
+// A real occluding object smooths out EVERY strip; a patch merely straddling
+// blank card plus real detail should not read as uniformly smooth. This does
+// NOT touch obstructionMaxFrac/obstructionTextureMax themselves — those need
+// a retest against a confirmed real-finger case before retuning, since
+// band-max reads systematically higher than the old whole-region average and
+// there's no ground truth here for what a genuine covering finger scores
+// under this new measure.
+function obstructionMetrics(rgba, gray, w, h, region){
+  const skin = skinToneFraction(rgba, w, h, region);
+  const {x0,y0,x1,y1} = region;
+  const regionH = y1-y0;
+  const xLo=Math.max(1,x0+1), xHi=Math.min(w-1,x1-1);
+  if(regionH<3 || xHi<=xLo) return { skin:+skin.toFixed(3), texture:0 };
+  const bandH=Math.max(2, Math.round(regionH*0.34));
+  const step =Math.max(1, Math.round(bandH/2));
+  let bestTexture=0;
+  for(let by=y0; by<y1; by+=step){
+    const yLo=Math.max(1,by+1), yHi=Math.min(h-1, Math.min(y1,by+bandH)-1);
+    if(yHi<=yLo) continue;
+    let sum=0, n=0;
+    for(let y=yLo; y<yHi; y++){
+      const b=y*w;
+      for(let x=xLo; x<xHi; x++){
+        const i=b+x;
+        sum += Math.abs(gray[i+1]-gray[i-1]) + Math.abs(gray[i+w]-gray[i-w]);
+        n++;
+      }
+    }
+    if(n){ const t=sum/n; if(t>bestTexture) bestTexture=t; }
+  }
+  return { skin:+skin.toFixed(3), texture:+bestTexture.toFixed(1) };
+}
+// Mean gradient magnitude along a thin band (edge presence along a guide border).
+// band = {x0,y0,x1,y1}; orient 'h' samples vertical gradient, 'v' horizontal.
+function edgeStrengthBand(gray, w, h, band, orient){
+  const {x0,y0,x1,y1}=band; let sum=0,n=0;
+  for(let y=Math.max(1,y0);y<Math.min(h-1,y1);y++){
+    for(let x=Math.max(1,x0);x<Math.min(w-1,x1);x++){
+      const i=y*w+x;
+      const g = orient==='h' ? Math.abs(gray[i+w]-gray[i-w])
+                             : Math.abs(gray[i+1]-gray[i-1]);
+      sum+=g; n++;
+    }
+  }
+  return n? sum/n : 0;
+}
+
+// Skew estimate (deg): compare the vertical position of the strongest horizontal
+// edge on the left third vs right third of the guide's top band. A tilted card
+// puts its top edge at different rows on each side.
+function skewFromTopBand(gray, w, h, guide){
+  const bandH = Math.max(6, Math.round((guide.y1-guide.y0)*0.12));
+  const yTop = guide.y0, yBot = Math.min(h-1, guide.y0+bandH*3);
+  function strongestRow(xa,xb){
+    let bestRow=yTop, bestVal=-1;
+    for(let y=Math.max(1,yTop);y<yBot;y++){
+      let acc=0,n=0;
+      for(let x=xa;x<xb;x++){const i=y*w+x;acc+=Math.abs(gray[i+w]-gray[i-w]);n++;}
+      const v=n?acc/n:0;
+      if(v>bestVal){bestVal=v;bestRow=y;}
+    }
+    return bestRow;
+  }
+  const third=Math.round((guide.x1-guide.x0)/3);
+  const leftRow  = strongestRow(guide.x0, guide.x0+third);
+  const rightRow = strongestRow(guide.x1-third, guide.x1);
+  const dx = (guide.x1-third/2) - (guide.x0+third/2);
+  const dy = rightRow - leftRow;
+  return Math.atan2(dy, dx) * 180/Math.PI;
+}
+
+// ---- FFT (radix-2, iterative) + 1D moiré peak score --------------------
+// Moiré from screen recapture shows as a concentrated mid/high-frequency peak.
+// We take luma row-means, run a 1D FFT, and measure the ratio of peak energy in
+// the mid/high band to the low-frequency baseline. Approximate but cheap; a full
+// 2D FFT is the heavier upgrade if this proves too coarse in practice.
+function fft1d(re, im){
+  const n=re.length;
+  for(let i=1,j=0;i<n;i++){
+    let bit=n>>1;
+    for(;j&bit;bit>>=1) j^=bit;
+    j^=bit;
+    if(i<j){[re[i],re[j]]=[re[j],re[i]];[im[i],im[j]]=[im[j],im[i]];}
+  }
+  for(let len=2;len<=n;len<<=1){
+    const ang=-2*Math.PI/len;
+    const wr=Math.cos(ang), wi=Math.sin(ang);
+    for(let i=0;i<n;i+=len){
+      let cr=1, ci=0;
+      for(let k=0;k<len/2;k++){
+        const ur=re[i+k], ui=im[i+k];
+        const vr=re[i+k+len/2]*cr - im[i+k+len/2]*ci;
+        const vi=re[i+k+len/2]*ci + im[i+k+len/2]*cr;
+        re[i+k]=ur+vr; im[i+k]=ui+vi;
+        re[i+k+len/2]=ur-vr; im[i+k+len/2]=ui-vi;
+        const ncr=cr*wr - ci*wi; ci=cr*wi + ci*wr; cr=ncr;
+      }
+    }
+  }
+}
+function nextPow2(x){let p=1;while(p<x)p<<=1;return p;}
+// Returns a moiré score: peak mid/high-band magnitude ÷ low-band mean. Higher =
+// more screen-like periodic energy.
+function moireScore(gray, w, h){
+  // Column-mean signal across the middle rows (captures vertical pixel-grid ripple)
+  const y0=Math.floor(h*0.35), y1=Math.floor(h*0.65);
+  const sig=new Float64Array(w);
+  for(let x=0;x<w;x++){
+    let s=0;for(let y=y0;y<y1;y++)s+=gray[y*w+x];
+    sig[x]=s/(y1-y0);
+  }
+  const N=nextPow2(w);
+  const re=new Float64Array(N), im=new Float64Array(N);
+  // mean-remove + zero-pad
+  let mean=0;for(let x=0;x<w;x++)mean+=sig[x];mean/=w;
+  for(let x=0;x<w;x++)re[x]=sig[x]-mean;
+  fft1d(re,im);
+  const half=N>>1;
+  const mag=new Float64Array(half);
+  for(let k=0;k<half;k++)mag[k]=Math.hypot(re[k],im[k]);
+  // low band = lowest 15%, mid/high = 25%..85%
+  const loEnd=Math.max(1,Math.floor(half*0.15));
+  const midStart=Math.floor(half*0.25), midEnd=Math.floor(half*0.85);
+  let loSum=0;for(let k=1;k<loEnd;k++)loSum+=mag[k];
+  const loMean=loSum/Math.max(1,loEnd-1);
+  let peak=0;for(let k=midStart;k<midEnd;k++)if(mag[k]>peak)peak=mag[k];
+  return loMean>1e-6 ? peak/loMean : 0;
+}
+
+// Fill ratio: fraction of the guide region whose gradient exceeds a small
+// threshold (a document has texture/print; empty background does not). Cheap
+// proxy for "is the card actually filling the guide."
+function fillRatio(gray, w, h, guide){
+  let active=0, tot=0;
+  for(let y=guide.y0+1;y<guide.y1-1;y++){
+    for(let x=guide.x0+1;x<guide.x1-1;x++){
+      const i=y*w+x;
+      const gx=Math.abs(gray[i+1]-gray[i-1]);
+      const gy=Math.abs(gray[i+w]-gray[i-w]);
+      if(gx+gy>18) active++;
+      tot++;
+    }
+  }
+  return tot? active/tot : 0;
+}
+
+// Bezel / nested-rectangle (Category 2, silent): edge energy in a band just
+// OUTSIDE the guide. A real hand-held card has empty/varied background there; a
+// phone/monitor being recaptured tends to show a hard rectangular frame.
+function bezelScore(gray, w, h, guide){
+  const pad=Math.round((guide.x1-guide.x0)*0.06);
+  const bands=[
+    {x0:guide.x0-pad,y0:guide.y0-pad,x1:guide.x1+pad,y1:guide.y0, o:'h'},     // top
+    {x0:guide.x0-pad,y0:guide.y1,x1:guide.x1+pad,y1:guide.y1+pad, o:'h'},     // bottom
+    {x0:guide.x0-pad,y0:guide.y0,x1:guide.x0,y1:guide.y1, o:'v'},             // left
+    {x0:guide.x1,y0:guide.y0,x1:guide.x1+pad,y1:guide.y1, o:'v'},             // right
+  ];
+  let s=0;for(const b of bands) s+=edgeStrengthBand(gray,w,h,{x0:Math.max(0,b.x0),y0:Math.max(0,b.y0),x1:Math.min(w,b.x1),y1:Math.min(h,b.y1)},b.o);
+  return s/bands.length;
+}
+
+// Export for node unit tests (no effect in browser).
+
+// ── Card detection: bright-region bounding box ──────────────────────────
+// A laminated ID is markedly brighter than a typical dark/wood/fabric surface,
+// so we segment "bright" pixels and take the bounding box of that region via
+// row/column projections. This is the "free-floating" detection the guide-based
+// v1/v2 deferred — it TRACKS the card wherever it is in frame instead of forcing
+// the user to fill a fixed box, and it's what the on-screen wireframe draws.
+// Limitation: fails if the background is also bright (white desk). That's the
+// documented trade-off; a saturation/edge-based segmentation is the upgrade.
+// ── Edge-projection card detection (background-independent) ─────────────
+// Keys on the card's long STRAIGHT edges, not its brightness — so a light card
+// on a light/busy surface (where brightness segmentation grabbed the whole
+// frame) is isolated by its edges instead. A continuous card edge accumulates
+// projection energy at every row/column it spans; random fabric texture does
+// not, so the card's four edges surface as the dominant peaks.
+function dominantPair(proj, minSep, minAbs){
+  const n=proj.length;
+  let sum=0; for(let i=0;i<n;i++) sum+=proj[i];
+  const mean=sum/n;
+  let sq=0; for(let i=0;i<n;i++){const d=proj[i]-mean; sq+=d*d;}
+  const std=Math.sqrt(sq/n);
+  // Outermost STRONG-edge lines = the document's outer border. Using the two
+  // TALLEST peaks failed on the back: a dense PDF417's bars are the tallest
+  // vertical edges and hijacked the box onto the barcode. The card's outer
+  // edges are the extreme strong lines; the barcode sits BETWEEN them.
+  const thr = Math.max(mean + 1.15*std, minAbs||0);
+  let first=-1,last=-1;
+  for(let i=0;i<n;i++){ if(proj[i]>thr){ if(first<0)first=i; last=i; } }
+  if(first<0 || last-first<minSep) return null;
+  return { a:first, b:last };
+}
+function detectCardByEdges(gray, w, h){
+  // Rank candidate lines by EDGE SUPPORT — the fraction of rows (or columns) in
+  // which a gradient is present — NOT by summed gradient magnitude.
+  // WHY: a document border is a LONG, often FAINT line spanning the card's full
+  // height; interior features (a PDF417 block, a text band) are SHORT but very
+  // intense. Summed magnitude conflates the two and the interior feature wins.
+  // That is exactly what broke real captures: a cream card held against a light
+  // palm — the posture we ourselves prescribed — has only ~30-40 grey levels of
+  // border contrast while its barcode spans 0-255, so the detector locked onto
+  // the barcode, the box came out SMALLER than the card, widthFrac was
+  // underestimated, and the distance gate happily let the user come far too
+  // close with the real card overflowing the frame.
+  // Support is contrast-independent above a small floor, so a faint long border
+  // beats an intense short one.
+  const gthr = 9;
+  const colSup=new Float64Array(w), rowSup=new Float64Array(h);
+  for(let y=1;y<h-1;y++){
+    const b=y*w;
+    for(let x=1;x<w-1;x++){
+      const i=b+x;
+      if(Math.abs(gray[i-1]-gray[i+1])>gthr) colSup[x]++;
+      if(Math.abs(gray[i-w]-gray[i+w])>gthr) rowSup[y]++;
+    }
+  }
+  const rowsN=Math.max(1,h-2), colsN=Math.max(1,w-2);
+  for(let x=0;x<w;x++) colSup[x]/=rowsN;
+  for(let y=0;y<h;y++) rowSup[y]/=colsN;
+  // absolute floor: a line must span at least 18% of the perpendicular extent,
+  // which no barcode band or text block can reach but a card border easily does
+  const cx=dominantPair(colSup, Math.round(w*0.15), 0.18);
+  const cy=dominantPair(rowSup, Math.round(h*0.15), 0.18);
+  if(!cx||!cy) return null;
+  let x0=cx.a, x1=cx.b, y0=cy.a, y1=cy.b;
+  if(x1-x0 < w*0.2 || y1-y0 < h*0.12) return null;   // too small to be a card
+  let bw=x1-x0, bh=y1-y0;
+  // The width axis (card left/right edges) is reliable; the height axis over-
+  // extends when the card is tilted or the surface adds horizontal edges,
+  // giving a too-tall box (wrong aspect -> bad skew + an obstruction false-
+  // positive as the centre patch dips onto the surface). A licence is a KNOWN
+  // ratio (ID-1, 1.586), so when the raw box is implausibly tall, re-derive its
+  // height from the trusted width and re-centre it.
+  // NOTE: this clamp must NOT run during the tilt step. Tilting about the
+  // vertical axis legitimately shrinks the projected width, pushing aspect below
+  // 1.35 — and the clamp would then rewrite the height to force aspect back to
+  // 1.586, erasing the exact angle signal the tilt step exists to measure.
+  const measuringTilt = (typeof state!=='undefined' && state && state.side==='tilt');
+  if(bw/Math.max(1,bh) < 1.35 && !measuringTilt){
+    const yc=(y0+y1)/2, targetH=bw/CONFIG.aspectRatio;
+    y0=Math.max(0, Math.round(yc-targetH/2));
+    y1=Math.min(h, Math.round(yc+targetH/2));
+    bh=y1-y0;
+  }
+  // v67: symmetric counterpart to the "too tall" clamp above. The back step's
+  // wider framing (more surrounding context in shot — see CONFIG's back-side
+  // override comment) gives the edge-projection detector more background
+  // clutter to mistake for a card edge, and unlike the "too tall" direction
+  // this had NO correction at all — a real diagnostics session showed
+  // last-frame aspect readings of 1.7-2.2 against a 2.05 gate ceiling, all
+  // uncorrected. Same fix, same justification: the width axis is the
+  // reliable one, so when the raw box comes out implausibly WIDE/SHORT,
+  // re-derive height from the trusted width instead of accepting a
+  // wrong-shaped box. 1.9 mirrors how far below 1.586 the existing 1.35
+  // trigger sits (1.586-1.35=0.236 -> 1.586+0.236=1.822, rounded up slightly
+  // for a small buffer against the true ratio).
+  if(bw/Math.max(1,bh) > 1.9 && !measuringTilt){
+    const yc=(y0+y1)/2, targetH=bw/CONFIG.aspectRatio;
+    y0=Math.max(0, Math.round(yc-targetH/2));
+    y1=Math.min(h, Math.round(yc+targetH/2));
+    bh=y1-y0;
+  }
+  return {
+    x0,y0,x1,y1, method:'edges', separation:99,
+    widthFrac:bw/w, heightFrac:bh/h, aspect:bw/Math.max(1,bh),
+    marginL:x0/w, marginR:(w-x1)/w, marginT:y0/h, marginB:(h-y1)/h,
+  };
+}
+// Cheap "is a barcode present" test: the dense vertical-bar signature of a
+// PDF417, WITHOUT decoding. Confirms we're looking at the BACK before capture,
+// and refuses a back image the server decoder would reject (saves a credit).
+// Returns the fraction of card rows whose horizontal transition density is
+// barcode-high.
+function barcodePresenceScore(gray, w, h, det){
+  const x0=Math.max(1,det.x0), x1=Math.min(w-1,det.x1);
+  const y0=Math.max(0,det.y0), y1=Math.min(h,det.y1);
+  const cw=x1-x0, ch=y1-y0;
+  if(cw<20 || ch<10) return 0;
+  // Scan OVERLAPPING HORIZONTAL BANDS and return the densest one. Never assume a
+  // fixed offset: the PDF417 sits in different places by jurisdiction (PA and TX
+  // differ), and the previous "lower 54% of the card" crop broke the moment card
+  // detection was fixed — it had been calibrated against a box that was wrongly
+  // landing on the barcode itself, so once the box became the true card border
+  // the crop landed on the text below the barcode and presence collapsed to ~0.
+  // Band-max is also more discriminating than a whole-card fraction: a barcode
+  // band scores near 1.0 while sparse text lines stay low.
+  const bandH=Math.max(6, Math.round(ch*0.22));
+  const step =Math.max(3, Math.round(bandH/2));
+  const edgeThr = CONFIG.gates.barcodeEdgeThreshold, denseThr = CONFIG.gates.barcodeRowDensityMin;
+  let best=0;
+  for(let by=y0; by+bandH<=y1; by+=step){
+    let dense=0;
+    for(let y=by;y<by+bandH;y++){
+      let trans=0; const base=y*w;
+      for(let x=x0+1;x<x1-1;x++){ if(Math.abs(gray[base+x+1]-gray[base+x-1])>edgeThr) trans++; }
+      if(trans/cw > denseThr) dense++;
+    }
+    const d=dense/bandH;
+    if(d>best) best=d;
+  }
+  return best;
+}
+// ── Screen-recapture signals (Category 2, silent) ───────────────────────
+// Photographing a refreshing display beats the camera's rolling shutter against
+// the panel refresh rate, producing horizontal brightness BANDING. Unlike moiré
+// (high-frequency, destroyed by downscaling and unresolvable on a Retina panel
+// at normal distance), banding is LOW frequency — wide stripes — so it survives
+// the 480px analysis frame and costs nothing extra to measure.
+// Returns peak/mean spectral ratio of the detrended row-luma profile.
+function bandingScore(gray, w, h){
+  const rows=new Float64Array(h);
+  for(let y=0;y<h;y++){ let s=0; const b=y*w; for(let x=0;x<w;x++) s+=gray[b+x]; rows[y]=s/w; }
+  // detrend: subtract a moving average so a slow lighting gradient isn't read as banding
+  const win=Math.max(3, Math.round(h*0.08));
+  const det=new Float64Array(h);
+  for(let y=0;y<h;y++){
+    let s=0,n=0;
+    for(let k=-win;k<=win;k++){ const yy=y+k; if(yy>=0&&yy<h){ s+=rows[yy]; n++; } }
+    det[y]=rows[y]-s/n;
+  }
+  const N=nextPow2(h);
+  const re=new Float64Array(N), im=new Float64Array(N);
+  for(let y=0;y<h;y++) re[y]=det[y];
+  fft1d(re,im);
+  const half=N>>1;
+  const lo=Math.max(2,Math.floor(half*0.02)), hi=Math.max(lo+2,Math.floor(half*0.5));
+  let peak=0,sum=0,n=0;
+  for(let k=lo;k<hi;k++){ const m=Math.hypot(re[k],im[k]); if(m>peak)peak=m; sum+=m; n++; }
+  const meanMag=n?sum/n:0;
+  return meanMag>1e-9 ? peak/meanMag : 0;
+}
+// Screen furniture: count strong straight edge lines OUTSIDE the document box.
+// A/B CAUTION: this INVERTED on the real test (genuine 5/32 vs screen 4/2) — a
+// couch seam and a forearm gave 32 on a genuine back capture. It measures
+// background clutter, not screens. KEPT rather than deleted, because bezelScore
+// looked equally dead under uncontrolled backgrounds and then separated cleanly
+// (~2x, both sides) once palm posture was standardised. Treat as unreliable
+// until re-tested under a prescribed background.
+// A card on a table has none; a card shown on a monitor sits inside window
+// chrome / toolbars / a bezel / a keyboard — all long straight lines. (Erik's
+// screen-recapture test images visibly contained exactly this, while every
+// existing metric ignored it.)
+function nestedRectScore(gray, w, h, det){
+  const col=new Float64Array(w), row=new Float64Array(h);
+  for(let y=1;y<h-1;y++){
+    for(let x=1;x<w-1;x++){
+      const i=y*w+x;
+      col[x]+=Math.abs(gray[i-1]-gray[i+1]);
+      row[y]+=Math.abs(gray[i-w]-gray[i+w]);
+    }
+  }
+  function strongOutside(proj, a0, a1, n){
+    const vals=[];
+    for(let i=0;i<n;i++) if(i<a0-2 || i>a1+2) vals.push(proj[i]);
+    if(vals.length<8) return 0;
+    const mean=vals.reduce((s,v)=>s+v,0)/vals.length;
+    const std=Math.sqrt(vals.reduce((s,v)=>s+(v-mean)*(v-mean),0)/vals.length);
+    if(std<1e-6) return 0;
+    let cnt=0; for(const v of vals) if(v>mean+2.2*std) cnt++;
+    return cnt;
+  }
+  return strongOutside(col,det.x0,det.x1,w) + strongOutside(row,det.y0,det.y1,h);
+}
+// ── Physical-presence signals (tilt / OVI response, replay detection) ──
+// A real laminated ID answers a change in viewing angle: the specular highlight
+// SLIDES across the surface and any OVI/hologram shifts hue. A screen is an
+// emissive flat plane and a photocopy is diffuse — neither reproduces that
+// angle-dependent behaviour. The client cannot judge authenticity; its job is to
+// capture a controlled multi-angle burst plus the measurements the backend needs.
+
+// Specular highlight within the card: how bright, how much, and WHERE.
+function specularStats(gray, w, h, det){
+  const x0=Math.max(0,det.x0), x1=Math.min(w,det.x1);
+  const y0=Math.max(0,det.y0), y1=Math.min(h,det.y1);
+  const cw=Math.max(1,x1-x0), ch=Math.max(1,y1-y0);
+  let maxL=0,sum=0,n=0;
+  for(let y=y0;y<y1;y++){ const b=y*w; for(let x=x0;x<x1;x++){ const v=gray[b+x]; if(v>maxL)maxL=v; sum+=v; n++; } }
+  const mean=n?sum/n:0, thr=Math.max(mean+28, mean*1.22);
+  let bright=0,cx=0,cy=0;
+  for(let y=y0;y<y1;y++){ const b=y*w; for(let x=x0;x<x1;x++){ if(gray[b+x]>thr){ bright++; cx+=x; cy+=y; } } }
+  return { specMax:+maxL.toFixed(0), specFrac:+(bright/Math.max(1,n)).toFixed(4),
+    specCX: bright? +(((cx/bright)-x0)/cw).toFixed(3) : null,
+    specCY: bright? +(((cy/bright)-y0)/ch).toFixed(3) : null };
+}
+// Mean saturation + circular-mean hue inside the card (OVI shifts hue with angle).
+function chromaStats(rgba, w, h, det){
+  const x0=Math.max(0,det.x0), x1=Math.min(w,det.x1);
+  const y0=Math.max(0,det.y0), y1=Math.min(h,det.y1);
+  let sat=0,n=0,hs=0,hc=0;
+  for(let y=y0;y<y1;y++){
+    for(let x=x0;x<x1;x++){
+      const p=(y*w+x)*4, R=rgba[p], G=rgba[p+1], B=rgba[p+2];
+      const mx=Math.max(R,G,B), mn=Math.min(R,G,B), d=mx-mn;
+      const sv = mx? d/mx : 0; sat+=sv; n++;
+      if(d>8){
+        let hdeg;
+        if(mx===R) hdeg=60*(((G-B)/d)%6);
+        else if(mx===G) hdeg=60*(((B-R)/d)+2);
+        else hdeg=60*(((R-G)/d)+4);
+        const rad=hdeg*Math.PI/180; hs+=Math.sin(rad)*sv; hc+=Math.cos(rad)*sv;
+      }
+    }
+  }
+  let hue=Math.atan2(hs,hc)*180/Math.PI; if(hue<0) hue+=360;
+  return { meanSat:+(n?sat/n:0).toFixed(4), hue:+hue.toFixed(1) };
+}
+// 64-bit average hash — for the backend's frame-repetition / replay-loop check.
+// Cheap, and carries no recoverable image content.
+function cellSignature(gray, w, h, N){
+  const cells=new Float64Array(N*N), bw=w/N, bh=h/N;
+  for(let by=0;by<N;by++){
+    for(let bx=0;bx<N;bx++){
+      const ax0=Math.floor(bx*bw), ax1=Math.max(ax0+1,Math.floor((bx+1)*bw));
+      const ay0=Math.floor(by*bh), ay1=Math.max(ay0+1,Math.floor((by+1)*bh));
+      let s=0,n=0;
+      for(let y=ay0;y<ay1;y++){ const b=y*w; for(let x=ax0;x<ax1;x++){ s+=gray[b+x]; n++; } }
+      cells[by*N+bx]=n?s/n:0;
+    }
+  }
+  return cells;
+}
+// 256-bit hash (16x16). DIVISION OF LABOUR, learned by testing: a hash is
+// 1-bit-quantised at the mean, so changes WITHIN an already-above-mean region
+// (e.g. a specular highlight sliding across the card) may not flip any bit.
+// So the hash is for CROSS-SUBMISSION IDENTITY — has this exact frame been seen
+// before, across sessions/clients — and NOT for within-burst variation.
+// minFrameDelta/meanFrameDelta below are the within-burst replay signal: a real
+// hand-held capture always varies frame to frame; a looped or static replay
+// gives a delta of ~0. Verified 0.66 (live) vs 0.00 (static) on synthetics.
+function aHash(gray, w, h){
+  const N=16, cells=cellSignature(gray,w,h,N), n=N*N;
+  let mean=0; for(let i=0;i<n;i++) mean+=cells[i]; mean/=n;
+  let hex='';
+  for(let i=0;i<n;i+=4){ let nib=0; for(let k=0;k<4;k++) if(cells[i+k]>mean) nib|=(1<<(3-k)); hex+=nib.toString(16); }
+  return hex;
+}
+// Mean absolute difference between two signatures — a direct measure of how
+// much the scene actually changed between frames.
+function sigDistance(a,b){
+  if(!a||!b||a.length!==b.length) return 0;
+  let s=0; for(let i=0;i<a.length;i++) s+=Math.abs(a[i]-b[i]);
+  return s/a.length;
+}
+// Hamming distance between two aHash() hex strings — number of differing
+// bits out of the fixed 64 (16x16 grid / 4 bits per hex char). Used to check
+// whether the barcode close-up crop actually shows the same region as the
+// wide back-of-card shot, not a different/mismatched card — see
+// computeBarcodeVisualMatch() below. No existing utility did this: the
+// other hash comparisons in this file (distinctFrameRatio) only test EXACT
+// string equality between successive frames of the same shot, a different
+// question from "how similar are these two DIFFERENT images."
+function hexHashHammingDistance(a,b){
+  if(!a||!b||a.length!==b.length) return null;
+  let dist=0;
+  for(let i=0;i<a.length;i++){
+    const x=parseInt(a[i],16)^parseInt(b[i],16);
+    dist += (x&1)+((x>>1)&1)+((x>>2)&1)+((x>>3)&1);
+  }
+  return dist;
+}
+// Summarise the tilt burst into the angle-response evidence the backend scores.
+function tiltSummary(samples){
+  if(!samples || !samples.length) return null;
+  const asp=samples.map(s=>s.aspect);
+  const pts=samples.filter(s=>s.specCX!=null);
+  let travel=0;
+  for(let i=0;i<pts.length;i++) for(let j=i+1;j<pts.length;j++){
+    const d=Math.hypot(pts[i].specCX-pts[j].specCX, pts[i].specCY-pts[j].specCY);
+    if(d>travel) travel=d;
+  }
+  const sats=samples.map(s=>s.meanSat), hues=samples.map(s=>s.hue);
+  const fr=samples.map(s=>s.specFrac), hashes=samples.map(s=>s.hash);
+  const deltas=samples.map(s=>s.delta).filter(v=>v!=null);
+  const distinct=new Set(hashes).size;
+  // circular hue spread
+  let hs=0,hc=0; for(const hh of hues){ const r=hh*Math.PI/180; hs+=Math.sin(r); hc+=Math.cos(r); }
+  const R=Math.hypot(hs,hc)/Math.max(1,hues.length);
+  return {
+    samples: samples.length,
+    aspectSpan: +(Math.max.apply(null,asp)-Math.min.apply(null,asp)).toFixed(3),
+    widthFracSpan: (function(){ const wf=samples.map(s=>s.widthFrac).filter(v=>v!=null);
+      return wf.length? +(Math.max.apply(null,wf)-Math.min.apply(null,wf)).toFixed(3) : null; })(),
+    specularTravel: +travel.toFixed(3),
+    specularFracRange: +(Math.max.apply(null,fr)-Math.min.apply(null,fr)).toFixed(4),
+    saturationRange: +(Math.max.apply(null,sats)-Math.min.apply(null,sats)).toFixed(4),
+    hueDispersion: +(1-R).toFixed(4),
+    distinctFrameRatio: +(distinct/hashes.length).toFixed(3),
+    minFrameDelta: deltas.length? +Math.min.apply(null,deltas).toFixed(2) : null,
+    meanFrameDelta: deltas.length? +(deltas.reduce((a,b)=>a+b,0)/deltas.length).toFixed(2) : null,
+    frameHashes: hashes,
+  };
+}
+// Enclosing-rectangle detection (Category 2, SILENT — never surfaced).
+// The spec's "nested rectangle" check, only now possible because the back step
+// is framed wide enough for a surrounding frame to be in shot at all.
+// KEY DIFFERENCE FROM screenFurnitureLines: that metric merely COUNTED strong
+// straight lines outside the card, so a couch seam or a forearm scored the same
+// as a monitor bezel — which is why it inverted in real testing. A screen or
+// phone displaying the ID is bounded by a frame that forms a CLOSED RECTANGLE
+// ENCLOSING the document. Requiring all four sides, positioned outside the card
+// on opposite axes, is what makes it specific instead of a clutter counter.
+function enclosingRectScore(gray, w, h, det){
+  const col=new Float64Array(w), row=new Float64Array(h);
+  for(let y=1;y<h-1;y++){
+    const b=y*w;
+    for(let x=1;x<w-1;x++){
+      const i=b+x;
+      col[x]+=Math.abs(gray[i-1]-gray[i+1]);
+      row[y]+=Math.abs(gray[i-w]-gray[i+w]);
+    }
+  }
+  const mx=Math.max(3,Math.round(w*0.02)), my=Math.max(3,Math.round(h*0.02));
+  function strongest(proj, lo, hi){
+    lo=Math.max(0,lo|0); hi=Math.min(proj.length,hi|0);
+    const n=hi-lo; if(n<4) return null;
+    let sum=0; for(let i=lo;i<hi;i++) sum+=proj[i];
+    const mean=sum/n;
+    let sq=0; for(let i=lo;i<hi;i++){ const d=proj[i]-mean; sq+=d*d; }
+    const std=Math.sqrt(sq/n); if(std<1e-6) return null;
+    let bi=-1,bv=-1; for(let i=lo;i<hi;i++) if(proj[i]>bv){ bv=proj[i]; bi=i; }
+    if(bi<0) return null;
+    const z=(bv-mean)/std;
+    return z>=2.2 ? { idx:bi, z:+z.toFixed(2) } : null;
+  }
+  const L=strongest(col, mx, det.x0-2);
+  const R=strongest(col, det.x1+2, w-mx);
+  const T=strongest(row, my, det.y0-2);
+  const B=strongest(row, det.y1+2, h-my);
+  const found=[L,R,T,B].filter(Boolean);
+  const sides=found.length;
+  const meanZ = sides ? +(found.reduce((a,x)=>a+x.z,0)/sides).toFixed(2) : 0;
+  // The earlier boolean required BOTH axes to clear a 1.05x margin, which is
+  // wrong twice over: containment is already guaranteed by construction (each
+  // side is searched only OUTSIDE the card), and a real bezel is often far out
+  // on one axis and close on the other. On the first real screen test it found
+  // all four sides (vs 2 on genuine — the correct signal) yet reported
+  // encloses:false because one axis sat barely outside the card. Report the
+  // per-axis margins and let the backend judge; the only guard kept is a small
+  // absolute minimum so the card's own edge shadow can't count as a side.
+  let encloses=false, gapFrac=null, gapX=null, gapY=null;
+  if(L&&R&&T&&B){
+    const cw=det.x1-det.x0, ch=det.y1-det.y0;
+    const marginL=det.x0-L.idx, marginR=R.idx-det.x1;
+    const marginT=det.y0-T.idx, marginB=B.idx-det.y1;
+    const minAbsX=Math.max(2,w*0.015), minAbsY=Math.max(2,h*0.015);
+    encloses = marginL>=minAbsX && marginR>=minAbsX && marginT>=minAbsY && marginB>=minAbsY;
+    gapX = +(((marginL+marginR)/Math.max(1,cw))).toFixed(3);
+    gapY = +(((marginT+marginB)/Math.max(1,ch))).toFixed(3);
+    gapFrac = +((gapX+gapY)/2).toFixed(3);
+  }
+  return { sides, meanZ, encloses, gapFrac, gapX, gapY };
+}
+// Geometry of the densest band — is the dense texture actually BARCODE-SHAPED?
+// Density alone says "something busy is here"; a PDF417 is a WIDE, SHORT block,
+// so confirming the shape turns "dense texture somewhere" into "a barcode-shaped
+// region is present". That is what makes an UNDECODABLE result meaningful to a
+// reviewer: block structure survives wear and scratching long after the
+// individual bars stop resolving, so a worn card reads as present-but-unreadable
+// rather than sliding toward looking absent.
+function barcodeRegionGeometry(gray, w, h, det){
+  const x0=Math.max(1,det.x0), x1=Math.min(w-1,det.x1);
+  const y0=Math.max(0,det.y0), y1=Math.min(h,det.y1);
+  const cw=x1-x0, ch=y1-y0;
+  if(cw<20||ch<10) return { score:0, aspect:null, widthFrac:0, heightFrac:0 };
+  // v67: shares CONFIG.gates.barcodeEdgeThreshold/barcodeRowDensityMin with
+  // barcodePresenceScore() above (was independently hardcoded 28/0.22 here —
+  // same underlying question, "is this row barcode-dense", so both functions
+  // now read the same tuned numbers instead of being able to drift apart).
+  const edgeThr = CONFIG.gates.barcodeEdgeThreshold, denseThr = CONFIG.gates.barcodeRowDensityMin;
+  const bandH=Math.max(6,Math.round(ch*0.22)), step=Math.max(3,Math.round(bandH/2));
+  let best=0, bestY=y0;
+  for(let by=y0; by+bandH<=y1; by+=step){
+    let dense=0;
+    for(let y=by;y<by+bandH;y++){
+      let tr=0; const b=y*w;
+      for(let x=x0+1;x<x1-1;x++) if(Math.abs(gray[b+x+1]-gray[b+x-1])>edgeThr) tr++;
+      if(tr/cw>denseThr) dense++;
+    }
+    const d=dense/bandH;
+    if(d>best){ best=d; bestY=by; }
+  }
+  // horizontal extent of the dense region inside the winning band
+  let first=-1,last=-1;
+  for(let x=x0+1;x<x1-1;x++){
+    let hits=0;
+    for(let y=bestY;y<bestY+bandH;y++) if(Math.abs(gray[y*w+x+1]-gray[y*w+x-1])>edgeThr) hits++;
+    if(hits/bandH>0.35){ if(first<0)first=x; last=x; }
+  }
+  const rw=(first<0)?0:(last-first);
+  return { score:+best.toFixed(3), widthFrac:+(rw/cw).toFixed(3),
+    heightFrac:+(bandH/ch).toFixed(3), aspect: rw>0 ? +(rw/bandH).toFixed(2) : null };
+}
+// Primary = edges; fall back to brightness (dark backgrounds) if edges find nothing.
+function detectCard(gray, w, h){
+  const e=detectCardByEdges(gray,w,h);
+  if(e) return e;
+  // Edge detection fails on motion-blurred / dim frames (support drops below the
+  // floor). Previously the brightness fallback then grabbed the WHOLE FRAME and
+  // reported it as a card — observed live as frames alternating between a
+  // correct box (aspect 1.59) and a bogus one (widthFrac 1.0, aspect 0.74),
+  // which reset the stability counter and made capture nearly impossible in
+  // dim light. A box that cannot be a document is worse than no box: return
+  // null so detectCardCoasted reuses the last good box for a couple of frames.
+  const b=detectCardBBox(gray,w,h);
+  if(b && !b.lowContrast){
+    const g=CONFIG.gates;
+    if(b.aspect < g.aspectMin*0.85 || b.aspect > g.aspectMax*1.15) return null;
+    if(b.widthFrac > 0.985 || b.heightFrac > 0.985) return null;
+  }
+  return b;
+}
+// Anti-flicker: reuse the last good box for up to 2 missed frames so the gates
+// (and the wireframe) don't strobe when detection momentarily drops out.
+let _lastGoodDet=null, _coast=0;
+function detectCardCoasted(gray, w, h){
+  const d=detectCard(gray,w,h);
+  if(d && !d.lowContrast){ _lastGoodDet=d; _coast=0; return d; }
+  if(_lastGoodDet && _coast<2){ _coast++; return _lastGoodDet; }
+  _lastGoodDet=null; return d;
+}
+
+function otsuThreshold(gray){
+  const hist=new Array(256).fill(0), n=gray.length;
+  for(let i=0;i<n;i++){ let v=gray[i]|0; if(v<0)v=0; else if(v>255)v=255; hist[v]++; }
+  let total=0; for(let t=0;t<256;t++) total+=t*hist[t];
+  let wB=0,sumB=0,best=-1,thr=127;
+  for(let t=0;t<256;t++){
+    wB+=hist[t]; if(!wB) continue;
+    const wF=n-wB; if(!wF) break;
+    sumB+=t*hist[t];
+    const mB=sumB/wB, mF=(total-sumB)/wF;
+    const between=wB*wF*(mB-mF)*(mB-mF);
+    if(between>best){ best=between; thr=t; }
+  }
+  return thr;
+}
+function detectCardBBox(gray, w, h){
+  let sum=0; for(let i=0;i<gray.length;i++) sum+=gray[i];
+  const mean=sum/gray.length;
+  let sq=0; for(let i=0;i<gray.length;i++){const d=gray[i]-mean; sq+=d*d;}
+  const std=Math.sqrt(sq/gray.length);
+  // Otsu finds the optimal bright/dark split for THIS frame's histogram — far
+  // more robust across lighting than a fixed mean+k*std offset. Floor it at the
+  // mean so we never pick a threshold below average brightness.
+  const thr=Math.max(otsuThreshold(gray), mean);
+  const col=new Int32Array(w), row=new Int32Array(h);
+  for(let y=0;y<h;y++){
+    const base=y*w;
+    for(let x=0;x<w;x++){ if(gray[base+x]>thr){ col[x]++; row[y]++; } }
+  }
+  // a column/row is "on the card" if a meaningful fraction of it is bright
+  const colCut=h*0.18, rowCut=w*0.18;
+  let x0=-1,x1=-1,y0=-1,y1=-1;
+  for(let x=0;x<w;x++) if(col[x]>colCut){ if(x0<0)x0=x; x1=x; }
+  for(let y=0;y<h;y++) if(row[y]>rowCut){ if(y0<0)y0=y; y1=y; }
+  if(x0<0||y0<0||x1<=x0||y1<=y0) return null;
+  // Guard: a "card" spanning essentially the whole frame is a bright background,
+  // not a document. Real capture leaves margin on at least one axis.
+  if((x1-x0)>=w*0.97 && (y1-y0)>=h*0.97) return null;
+  // Reject false positives: the detected region must be meaningfully BRIGHTER
+  // than what surrounds it. On a uniform/textured background with no card, the
+  // projections can mark the whole frame — but inside≈outside brightness, so we
+  // drop it. A real bright card sits well above its background.
+  let inSum=0,inN=0,outSum=0,outN=0;
+  for(let y=0;y<h;y++){
+    const inY = y>=y0&&y<y1;
+    for(let x=0;x<w;x++){
+      const v=gray[y*w+x];
+      if(inY && x>=x0 && x<x1){ inSum+=v; inN++; } else { outSum+=v; outN++; }
+    }
+  }
+  const meanIn = inN?inSum/inN:0, meanOut = outN?outSum/outN:0;
+  const separation = meanIn - meanOut;
+  const g=CONFIG.gates;
+  // Truly nothing distinct -> null (caller shows "show your ID").
+  if(separation < g.sepWarn) return null;
+  const bw=x1-x0, bh=y1-y0;
+  const geom = {
+    x0,y0,x1,y1,
+    widthFrac: bw/w, heightFrac: bh/h,
+    aspect: bw/Math.max(1,bh),
+    marginL:x0/w, marginR:(w-x1)/w, marginT:y0/h, marginB:(h-y1)/h,
+    thr:+thr.toFixed(1), separation:+separation.toFixed(1),
+  };
+  // A region is there but too close in brightness to trust -> low-contrast warning.
+  if(separation < g.sepConfident) return { lowContrast:true, ...geom };
+  return geom;
+}
+// Crop a gray buffer to a bbox (for running quality metrics on the card only).
+function cropGray(gray, w, h, bb){
+  const cw=bb.x1-bb.x0, ch=bb.y1-bb.y0;
+  const g=new Float32Array(cw*ch);
+  for(let y=0;y<ch;y++){ const s=(bb.y0+y)*w+bb.x0, d=y*cw;
+    for(let x=0;x<cw;x++) g[d+x]=gray[s+x]; }
+  return {g, w:cw, h:ch};
+}
+function cropRGBA(rgba, w, h, bb){
+  const cw=bb.x1-bb.x0, ch=bb.y1-bb.y0;
+  const a=new Uint8ClampedArray(cw*ch*4);
+  for(let y=0;y<ch;y++){
+    let s=((bb.y0+y)*w+bb.x0)*4, d=y*cw*4;
+    for(let x=0;x<cw*4;x++) a[d+x]=rgba[s+x];
+  }
+  return {rgba:a, w:cw, h:ch};
+}
+
+if(typeof module!=='undefined' && module.exports){
+  module.exports = { toGray, laplacianVariance, exposureStats, contrastStd,
+    colorCastRatio, skinToneFraction, edgeStrengthBand, skewFromTopBand,
+    fft1d, nextPow2, moireScore, fillRatio, bezelScore,
+    detectCardBBox, detectCardByEdges, detectCard, dominantPair, barcodePresenceScore, barcodeRegionGeometry, obstructionMetrics,
+    bandingScore, nestedRectScore, enclosingRectScore, specularStats, chromaStats, aHash, cellSignature, sigDistance, tiltSummary,
+    otsuThreshold, cropGray, cropRGBA, CONFIG };
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 2 — DEVICE / VIRTUAL-CAMERA SIGNAL (Category 2, silent)
+   Browser-only APIs, measured client-side, result is metadata for the backend
+   — never acted on in the UI.
+   ════════════════════════════════════════════════════════════════════════ */
+async function collectDeviceSignal(activeTrack){
+  const out = { virtualCameraSuspected:false, matchedName:null, labels:[], settings:null, capabilities:null };
+  try{
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const cams = devs.filter(d=>d.kind==='videoinput');
+    out.labels = cams.map(d=>d.label||'');
+    for(const label of out.labels){
+      const lc=label.toLowerCase();
+      const hit=VIRTUAL_CAM_NAMES.find(n=>lc.includes(n));
+      if(hit){ out.virtualCameraSuspected=true; out.matchedName=hit; break; }
+    }
+  }catch(e){ out.enumerateError = e.message; }
+  try{
+    if(activeTrack){
+      out.settings = activeTrack.getSettings ? activeTrack.getSettings() : null;
+      out.capabilities = activeTrack.getCapabilities ? activeTrack.getCapabilities() : null;
+      // Plausibility: a real camera reports a bounded frameRate range and a
+      // deviceId; many virtual cams report implausibly round/empty capabilities.
+      if(out.capabilities && Object.keys(out.capabilities).length<=1){
+        out.capabilitiesSuspicious = true;
+      }
+    }
+  }catch(e){ out.settingsError = e.message; }
+  return out;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 3 — CAMERA + STATE
+   ════════════════════════════════════════════════════════════════════════ */
+const els = {
+  screenIntro:  document.getElementById('screen-intro'),
+  screenCapture:document.getElementById('screen-capture'),
+  screenResult: document.getElementById('screen-result'),
+  camArea: document.getElementById('cam-area'),
+  video:   document.getElementById('video'),
+  overlay: document.getElementById('overlay'),
+  camSelect:document.getElementById('cam-select'),
+  btnStart:document.getElementById('btn-start'),
+  introErr:document.getElementById('intro-err'),
+  promptSide:document.getElementById('prompt-side'),
+  promptMain:document.getElementById('prompt-main'),
+  guidance:document.getElementById('guidance'),
+  chips:   document.getElementById('chips'),
+  flash:   document.getElementById('flash'),
+  tiltDemo:document.getElementById('tilt-demo'),
+  debug:   document.getElementById('debug'),
+  debugToggle:document.getElementById('debug-toggle'),
+  debugCat1:document.getElementById('debug-cat1'),
+  debugCat2:document.getElementById('debug-cat2'),
+  dbgCopy:document.getElementById('dbg-copy'),
+  dbgCopyStatus:document.getElementById('dbg-copy-status'),
+  logBadge:document.getElementById('log-badge'),
+  shotFront:document.getElementById('shot-front'),
+  shotBack:document.getElementById('shot-back'),
+  shotBarcode:document.getElementById('shot-barcode'),
+  shotBarcodeWrap:document.getElementById('shot-barcode-wrap'),
+  payloadJson:document.getElementById('payload-json'),
+  btnRestart:document.getElementById('btn-restart'),
+  btnCopy: document.getElementById('btn-copy'),
+};
+
+const state = {
+  side: 'front',                 // 'front' | 'back'
+  stream: null,
+  activeTrack: null,
+  running: false,
+  stableCount: 0,
+  log: [],                       // rolling per-frame diagnostics (capped)
+  logging: false,
+  burst: [],                     // rolling {dataUrl, sharpness, gray-hash} for best-frame + replay
+  lastProcess: 0,
+  lastBarcode: 0,
+  barcodeReader: null,
+  barcodeResult: null,           // decoded PDF417 string once found (back side)
+  captured: { front:null, back:null },
+  deviceSignal: null,
+  barcodeLighting: { torchSupported:false, torchEnabled:false, lastExposure:null, adjustmentInFlight:false },
+  // per-side accumulated silent signals (worst/representative sample at lock time)
+  silent: { front:null, back:null },
+};
+
+const aCanvas = document.createElement('canvas');   // analysis (downscaled)
+const aCtx = aCanvas.getContext('2d', { willReadFrequently:true });
+const capCanvas = document.createElement('canvas');  // full-res capture
+const capCtx = capCanvas.getContext('2d');
+
+function showScreen(which){
+  [els.screenIntro,els.screenCapture,els.screenResult].forEach(s=>s.classList.remove('active'));
+  which.classList.add('active');
+}
+
+async function enumerateCameras(){
+  try{
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const cams = devs.filter(d=>d.kind==='videoinput');
+    els.camSelect.innerHTML = '<option value="">Default (rear preferred)</option>';
+    cams.forEach((c,i)=>{
+      const o=document.createElement('option');
+      o.value=c.deviceId; o.textContent=c.label||('Camera '+(i+1));
+      els.camSelect.appendChild(o);
+    });
+  }catch(e){/* labels need permission; fine pre-grant */}
+}
+
+function supportsMode(capabilities, name, mode){
+  const values=capabilities && capabilities[name];
+  return Array.isArray(values) && values.includes(mode);
+}
+
+async function applySupportedCaptureControls(){
+  const track=state.activeTrack;
+  if(!track || !track.getCapabilities || !track.applyConstraints) return;
+  let caps={}; try{ caps=track.getCapabilities()||{}; }catch(_){ return; }
+  const advanced={};
+  if(supportsMode(caps,'focusMode','continuous')) advanced.focusMode='continuous';
+  if(supportsMode(caps,'exposureMode','continuous')) advanced.exposureMode='continuous';
+  if(supportsMode(caps,'whiteBalanceMode','continuous')) advanced.whiteBalanceMode='continuous';
+  state.barcodeLighting.torchSupported=caps.torch===true;
+  if(!Object.keys(advanced).length) return;
+  try{ await track.applyConstraints({advanced:[advanced]}); }catch(_){ /* best effort */ }
+}
+
+async function setBarcodeTorch(enabled){
+  const track=state.activeTrack;
+  if(!track || !state.barcodeLighting.torchSupported || state.barcodeLighting.torchEnabled===enabled || state.barcodeLighting.adjustmentInFlight) return;
+  state.barcodeLighting.adjustmentInFlight=true;
+  try{
+    await track.applyConstraints({advanced:[{torch:enabled}]});
+    state.barcodeLighting.torchEnabled=enabled;
+  }catch(_){ state.barcodeLighting.torchSupported=false; }
+  finally{ state.barcodeLighting.adjustmentInFlight=false; }
+}
+
+function barcodeExposure(canvas){
+  try{
+    const ctx=canvas.getContext('2d',{willReadFrequently:true});
+    return exposureStats(toGray(ctx.getImageData(0,0,canvas.width,canvas.height).data,canvas.width,canvas.height));
+  }catch(_){ return null; }
+}
+
+function adaptBarcodeLighting(canvas){
+  const exp=barcodeExposure(canvas);
+  if(!exp) return;
+  state.barcodeLighting.lastExposure=exp;
+  if(exp.meanLuma<72 || exp.darkFrac>0.52) setBarcodeTorch(true);
+  else if(exp.meanLuma>190 || exp.blownFrac>0.035) setBarcodeTorch(false);
+}
+
+function barcodeLightingGuidance(){
+  const exp=state.barcodeLighting.lastExposure;
+  if(!exp) return null;
+  if(state.barcodeLighting.torchEnabled) return 'Rear light is on — hold steady and tilt slightly if you see glare';
+  if(exp.meanLuma<72 || exp.darkFrac>0.52) return 'Need more even light — move to a brighter area or enable a room light';
+  if(exp.meanLuma>190 || exp.blownFrac>0.035) return 'Reduce glare — angle the card slightly away from direct light';
+  return null;
+}
+
+async function startCamera(){
+  els.introErr.textContent='';
+  const chosen = els.camSelect.value;
+  // High resolution + environment (rear) camera — CRITICAL: the liveness
+  // component uses 640x480 front-facing, which is far too low for document
+  // capture and PDF417 decode (that low res is exactly what the app's whole
+  // v26–v41 barcode saga fought). Autocapture opens its OWN stream.
+  //
+  // ideal:1920x1080 was itself later confirmed to be part of the same
+  // problem, not just an old baseline: a real driver's-license PDF417 packs
+  // a dense grid of codewords into a small physical area, and once cropped
+  // down to just the barcode strip (per BARCODE_GUIDE) the available pixel
+  // budget at 1080p-ish capture resolution works out to well under 2px per
+  // narrow bar module — under the ~3px/module real decoders generally need
+  // for reliable results, independent of which decoder library is used
+  // (this was confirmed the hard way: three different PDF417 decoders —
+  // pyzbar, zxing-cpp, and now the original Java ZXing — all failed on the
+  // same real captured barcode images, ruling out a decoder-quality
+  // explanation and pointing at the shared input resolution instead).
+  // `ideal` is advisory, not a hard minimum — a device/browser that can't
+  // deliver 4K here just falls back to its own real maximum, so asking for
+  // more costs nothing on a device that can't provide it, and directly
+  // raises the pixel budget on one that can. The continuous per-frame
+  // quality-gate analysis elsewhere (CONFIG.analysisWidth = 480) already
+  // downscales to a fixed small width regardless of the source stream's
+  // resolution, so this doesn't add CPU cost there — only the barcode crop
+  // and document capture, which both read the video at its full native
+  // resolution, actually benefit.
+  const constraints = {
+    audio:false,
+    video: chosen
+      ? { deviceId:{exact:chosen}, width:{ideal:3840}, height:{ideal:2160} }
+      : { facingMode:{ideal:'environment'}, width:{ideal:3840}, height:{ideal:2160} }
+  };
+  try{
+    state.stream = await navigator.mediaDevices.getUserMedia(constraints);
+  }catch(e){
+    // Fall back to any camera if environment/exact fails (desktop, etc.)
+    try{ state.stream = await navigator.mediaDevices.getUserMedia({video:true,audio:false}); }
+    catch(e2){ els.introErr.textContent = 'Camera unavailable: '+(e2.message||e2.name)+'. On a phone this needs the https ngrok URL, not a plain http LAN address.'; return; }
+  }
+  els.video.srcObject = state.stream;
+  state.activeTrack = state.stream.getVideoTracks()[0];
+  await applySupportedCaptureControls();
+  // Mirror the PREVIEW only for a user-facing (front) camera so movement feels
+  // natural, like a mirror. Rear/environment cameras (the real phone use case)
+  // are never mirrored. drawImage() reads the raw sensor frame regardless of CSS
+  // transform, so analysis and the captured image are ALWAYS un-mirrored/correct.
+  let facing = '';
+  try{ facing = (state.activeTrack.getSettings && state.activeTrack.getSettings().facingMode) || ''; }catch(_){}
+  els.video.classList.toggle('mirror', facing === 'user');
+  els.overlay.classList.toggle('mirror', facing === 'user'); // keep guide box in lockstep with the video flip
+  await els.video.play().catch(()=>{});
+  state.deviceSignal = await collectDeviceSignal(state.activeTrack);  // silent, once
+  await enumerateCameras();
+  showScreen(els.screenCapture);
+  beginSide('front');
+  state.running = true;
+  requestAnimationFrame(loop);
+  // v68.15.2: Tesseract loads in the background during the front + tilt/OVI
+  // steps -- by the time the back step (where MRZ OCR actually runs, see
+  // maybeAttemptMrzOcr()) is reached it's almost always ready, same
+  // "load early, use late" precedent as the booklet file's own boot().
+  initTesseract().catch(e => console.warn('tesseract_init_error:', e && e.message));
+}
+
+function stopCamera(){
+  state.running=false;
+  setBarcodeTorch(false);
+  if(state.stream) state.stream.getTracks().forEach(t=>t.stop());
+  state.stream=null; state.activeTrack=null;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 4 — PER-FRAME GATE EVALUATION
+   Returns { gates:{...}, metrics:{...}, silent:{...}, guide } for one frame.
+   Category 1 gate booleans -> chips + guidance. Category 2 values -> silent.
+   ════════════════════════════════════════════════════════════════════════ */
+function computeGuide(w,h){
+  // Card-shaped guide centred in the analysis frame at the ID aspect ratio.
+  const shorter = Math.min(w,h);
+  const gw = Math.round(Math.min(w*0.9, shorter*CONFIG.guideFillFrac*CONFIG.aspectRatio));
+  const gh = Math.round(gw / CONFIG.aspectRatio);
+  const x0 = Math.round((w-gw)/2), y0 = Math.round((h-gh)/2);
+  return { x0, y0, x1:x0+gw, y1:y0+gh };
+}
+
+function evaluateFrame(){
+  const vw = els.video.videoWidth, vh = els.video.videoHeight;
+  if(!vw||!vh) return null;
+  const w = CONFIG.analysisWidth;
+  const h = Math.round(w * vh/vw);
+  aCanvas.width=w; aCanvas.height=h;
+  aCtx.drawImage(els.video,0,0,w,h);
+  const rgba = aCtx.getImageData(0,0,w,h).data;
+  const gray = toGray(rgba,w,h);
+  const t=CONFIG.gates;
+
+  // ── detect the card (bright-region bbox) ──
+  const det = detectCardCoasted(gray,w,h);
+
+  // whole-frame exposure is always available (so we can guide "too dark" even
+  // with no card detected yet)
+  const frameExp = exposureStats(gray);
+
+  // Category 2 silent signals (whole frame is fine for these)
+  const silentGuide = det || {x0:Math.round(w*0.1),y0:Math.round(h*0.1),x1:Math.round(w*0.9),y1:Math.round(h*0.9)};
+  const silent = {
+    moireScore: +moireScore(gray,w,h).toFixed(3),
+    bezelScore: +bezelScore(gray,w,h,silentGuide).toFixed(3),
+    banding: +bandingScore(gray,w,h).toFixed(2),
+    screenFurnitureLines: nestedRectScore(gray,w,h,silentGuide),
+    hash: aHash(gray,w,h),           // replay-detection feed for the backend
+  };
+  // Enclosing-rectangle check runs on the BACK only, where the wider framing
+  // gives a surrounding bezel room to appear. Silent: computed and shipped,
+  // never surfaced to the user regardless of outcome.
+  if(state.side==='back' && det && !det.lowContrast){
+    const er = enclosingRectScore(gray,w,h,det);
+    silent.enclosingRectSides = er.sides;
+    silent.enclosingRectZ = er.meanZ;
+    silent.enclosingRectEncloses = er.encloses;
+    silent.enclosingRectGap = er.gapFrac;
+    silent.enclosingRectGapX = er.gapX;
+    silent.enclosingRectGapY = er.gapY;
+  }
+
+  if(!det || det.lowContrast){
+    // Either nothing distinct, or a region too close in brightness to the
+    // background to trust. Quality can't be judged in either case.
+    const gates = { boundary:false, distance:false, skew:false, sharpness:false,
+      glare:false, exposure:false, contrast:false, colorCast:false, obstruction:false };
+    const metrics = { detected:false, lowContrast:!!(det&&det.lowContrast),
+      separation: det?det.separation:0,
+      meanLuma:+frameExp.meanLuma.toFixed(0),
+      widthFrac:0, aspect:0, marginMin:0, sharp:0, contrast:0, cast:0, skew:0, obstruction:0,
+      blownFrac:+frameExp.blownFrac.toFixed(4), darkFrac:+frameExp.darkFrac.toFixed(3) };
+    return { gates, metrics, silent, det:(det&&det.lowContrast)?det:null, w, h, sharp:0 };
+  }
+
+  // ── quality metrics computed on the CARD CROP (background excluded) ──
+  const cg = cropGray(gray,w,h,det);
+  const cr = cropRGBA(rgba,w,h,det);
+  const sharp = laplacianVariance(cg.g,cg.w,cg.h);
+  const exp = exposureStats(cg.g);
+  const contrast = contrastStd(cg.g);
+  const cast = colorCastRatio(cr.rgba);
+  const skew = skewFromTopBand(gray,w,h,det);      // top edge of the detected box
+  // obstruction: skin in the detected card's centre patch (skips photo + grips)
+  const dw=det.x1-det.x0, dh=det.y1-det.y0;
+  const centre={ x0:Math.round(det.x0+dw*0.30), x1:Math.round(det.x1-dw*0.30),
+                 y0:Math.round(det.y0+dh*0.22), y1:Math.round(det.y1-dh*0.22) };
+  const obs=obstructionMetrics(rgba,gray,w,h,centre);
+  const obstruction=obs.skin;
+  const marginMin=Math.min(det.marginL,det.marginR,det.marginT,det.marginB);
+
+  // Barcode presence on a small FULL-RES crop of the card's lower band.
+  // Required by the wider back framing: at 480px analysis width with the card
+  // at ~0.5 of frame, PDF417 bars fall below one pixel and smear into grey, so
+  // the analysis-frame version would stop detecting a barcode that is plainly
+  // there — and that gate is what stops the FRONT being captured as the back.
+  const barcodePresence = state.side==='back' ? barcodePresenceFullRes(det,w,h) : 0;
+  const gates = {
+    boundary:   marginMin>=t.inFrameMargin && det.aspect>=t.aspectMin && det.aspect<=t.aspectMax,
+    distance:   det.widthFrac>=(state.side==='back'?t.backDistWidthMin:t.distWidthMin)
+             && det.widthFrac<=(state.side==='back'?t.backDistWidthMax:t.distWidthMax),
+    skew:       Math.abs(skew) <= (state.side==='back'?t.backSkewMaxDeg:t.skewMaxDeg),
+    sharpness:  sharp >= (state.side==='back'?t.backSharpnessMin:t.sharpnessMin),
+    glare:      exp.blownFrac <= t.glareMaxFrac,
+    exposure:   exp.meanLuma>=t.meanLumaMin && exp.meanLuma<=t.meanLumaMax && exp.darkFrac<=t.underExpMaxFrac,
+    contrast:   contrast >= (state.side==='back'?t.backContrastMinStd:t.contrastMinStd),
+    colorCast:  cast <= (state.side==='back'?t.backColorCastMaxRatio:t.colorCastMaxRatio),
+    // fails only when BOTH skin-like AND smooth (see obstructionMetrics)
+    obstruction: !(obs.skin > t.obstructionMaxFrac && obs.texture < t.obstructionTextureMax),
+  };
+  if(state.side==='back') gates.barcodePresent = barcodePresence >= t.barcodePresenceMin;
+  // Ship the PRESENCE SCORE itself, not just the pass/fail. Hypothesis worth
+  // testing with data: a screen attack is always SECOND-GENERATION imagery —
+  // photographed, JPEG-compressed, displayed, re-photographed — and each
+  // generation strips the high-frequency detail that fine PDF417 bars consist
+  // of. Erik independently reported the back step being "much harder to capture
+  // from the screen" on two separate occasions. If that shows up as a
+  // consistently lower presence score, it is a physical asymmetry that (unlike
+  // bezelScore) does not depend on the user's backdrop and (unlike the motion
+  // metrics) does not depend on how steadily they held the phone.
+  if(state.side==='back'){
+    silent.barcodePresenceScore = +barcodePresence.toFixed(4);
+    const bg = state.lastBarcodeGeom || { aspect:null, widthFrac:0 };
+    silent.barcodeRegionAspect = bg.aspect;       // PDF417 is wide+short
+    silent.barcodeRegionWidthFrac = bg.widthFrac; // how much of the card width it spans
+    silent.barcodeCropSharp = state.lastBarcodeCropSharp ?? null;
+  }
+
+  let tiltSample=null;
+  if(state.side==='tilt'){
+    const sig=cellSignature(gray,w,h,8);
+    const delta = state.lastTiltSig ? +sigDistance(sig,state.lastTiltSig).toFixed(2) : null;
+    state.lastTiltSig = sig;
+    tiltSample = Object.assign({ aspect:+det.aspect.toFixed(3), widthFrac:+det.widthFrac.toFixed(3), sharp:+sharp.toFixed(0), hash:silent.hash, delta },
+      specularStats(gray,w,h,det), chromaStats(rgba,w,h,det));
+  }
+  const metrics = { detected:true, meanLuma:+exp.meanLuma.toFixed(0),
+    separation: det.separation, barcodePresence:+barcodePresence.toFixed(3),
+    widthFrac:+det.widthFrac.toFixed(2), aspect:+det.aspect.toFixed(2),
+    marginMin:+marginMin.toFixed(3), sharp:+sharp.toFixed(0), contrast:+contrast.toFixed(0),
+    cast:+cast.toFixed(2), skew:+skew.toFixed(1), obstruction:+obstruction.toFixed(3), obsTexture:obs.texture,
+    blownFrac:+exp.blownFrac.toFixed(4), darkFrac:+exp.darkFrac.toFixed(3),
+    // `sharp` above is measured on the 480px analysis frame -- see the
+    // barcodePresence comment just above for why that's structurally unable
+    // to represent PDF417 bar-level detail. This is the SAME Laplacian-variance
+    // measurement taken on the actual full-resolution crop barcodePresence
+    // itself scores, back side only (0 elsewhere, matching barcodePresence).
+    barcodeCropSharp: state.side==='back' ? (state.lastBarcodeCropSharp ?? 0) : 0 };
+
+  // Conditions under which every other signal on this frame was measured.
+  // Shipped as CONTEXT, never used to auto-adjust any anti-spoof threshold:
+  // lighting is attacker-controlled, so a threshold that adapts to it becomes a
+  // dial the attacker holds. The backend can stratify or normalise using
+  // population data an attacker cannot see. This also addresses what has
+  // undermined every A/B so far — genuine and screen captures compared across
+  // sessions with different lighting, and the difference read as signal.
+  silent.conditions = { meanLuma:metrics.meanLuma, cast:metrics.cast,
+    contrast:metrics.contrast, sharp:metrics.sharp, obsTexture:metrics.obsTexture };
+  return { gates, metrics, silent, det, w, h, sharp, tiltSample };
+}
+
+// Priority-ordered guidance: surface the single most actionable failing gate.
+function guidanceFor(gates, metrics){
+  if(!metrics.detected){
+    if(metrics.lowContrast) return {msg:'Low contrast — use a darker background',ok:false};
+    if(metrics.meanLuma < CONFIG.gates.meanLumaMin) return {msg:'Too dark — add light',ok:false};
+    return {msg:'Show your ID to the camera',ok:false};
+  }
+  if(!gates.boundary){
+    if(metrics.marginMin < CONFIG.gates.inFrameMargin) return {msg:'Fit the whole ID in view',ok:false};
+    // v67: this used to always say "Straighten the ID" for every non-margin
+    // boundary failure, including a bad detected ASPECT ratio (box too wide
+    // or too tall relative to the card's known 1.586 shape) -- a real,
+    // separate problem from in-plane rotation, which already has its own
+    // dedicated `skew` gate/message below. Saying "straighten" for an
+    // aspect problem pointed the user at the wrong fix.
+    if(metrics.aspect < CONFIG.gates.aspectMin || metrics.aspect > CONFIG.gates.aspectMax)
+      return {msg:'Hold the ID flat and centered',ok:false};
+    return {msg:'Straighten the ID',ok:false};
+  }
+  if(!gates.distance){
+    const lo = state.side==='back' ? CONFIG.gates.backDistWidthMin : CONFIG.gates.distWidthMin;
+    return metrics.widthFrac < lo
+      ? {msg:'Move ID closer',ok:false} : {msg:'Move ID back a little',ok:false};
+  }
+  // v67: obstruction now checked BEFORE barcodePresent (was after). With
+  // barcodePresent failing ~99% of frames in a real diagnostics session, it
+  // dominated this priority list and the obstruction message below was
+  // essentially unreachable -- a real covering finger would ALSO tank
+  // barcodePresent, so a user whose actual problem was a finger over the
+  // barcode only ever saw "Hold steady — locating the barcode" and had no
+  // way to learn what to actually change. Obstruction is the more
+  // actionable, more likely-to-be-root-cause message when both are failing
+  // together, so it goes first.
+  if(!gates.obstruction) return {msg:'Move your finger off the card',ok:false};
+  // This only fires once boundary/distance/obstruction already passed,
+  // meaning the back of the card IS correctly framed and unobstructed --
+  // "Flip to the barcode side" here was actively wrong (confirmed across two
+  // real diagnostics sessions where this was the binding gate while already
+  // on the correct side) and would tell someone to flip a card they hadn't
+  // turned away from.
+  if(gates.barcodePresent===false) return {msg:'Hold steady — locating the barcode',ok:false};
+  if(!gates.exposure)  return metrics.meanLuma<CONFIG.gates.meanLumaMin
+                        ? {msg:'Too dark — more light',ok:false}
+                        : {msg:'Too bright — reduce light',ok:false};
+  if(!gates.glare)     return {msg:'Glare on card — tilt away from light',ok:false};
+  if(!gates.skew)      return {msg:'Straighten the card',ok:false};
+  if(!gates.sharpness) return {msg:'Hold steady — image blurry',ok:false};
+  if(!gates.contrast)  return {msg:'Low contrast — steadier light',ok:false};
+  if(!gates.colorCast) return {msg:'Colour looks off — adjust lighting',ok:false};
+  if(gates.barcode===false) return {msg:'Line up the barcode — hold still',ok:false};
+  return {msg:'Hold still…',ok:true};
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 5 — MAIN LOOP
+   ════════════════════════════════════════════════════════════════════════ */
+function loop(ts){
+  if(!state.running) return;
+  try{
+    if(state.side==='barcode'){
+      if(layoutOverlay()) paintBarcodeGuide();
+      barcodeStepTick(ts);
+    } else if(state.side==='mrz'){
+      if(layoutOverlay()) paintMrzGuide();
+      mrzStepTick(ts);
+    } else if(state.side==='tilt'){
+      if(layoutOverlay()) paintGuide();
+      tiltStepTick(ts);
+    } else {
+      if(layoutOverlay()) paintGuide();
+      if(ts - state.lastProcess >= CONFIG.processEveryMs){
+        state.lastProcess = ts;
+        const res = evaluateFrame();
+        if(res) applyFrameResult(res, ts);
+      }
+    }
+  }catch(e){
+    // A single frame's error must never kill the rAF loop (that would freeze
+    // chips/guide/debug and look like a hang). Log and keep going.
+    console.error('frame loop error:', e);
+  }
+  requestAnimationFrame(loop);
+}
+
+function applyFrameResult(res, ts){
+  const { gates, metrics, silent, det } = res;
+  let passAll = Object.values(gates).every(Boolean);
+  // Flip-hold: just after entering the back step, refuse to lock so the front
+  // (still in frame mid-flip) can't be snapped as the back.
+  if(state.side==='back' && (ts-(state.backStepStart||0)) < BACK_FLIP_HOLD_MS){ passAll=false; els.guidance.textContent='Flip the card over'; }
+
+  renderChips(gates);
+  const g = guidanceFor(gates, metrics);
+  els.guidance.textContent = g.msg;
+  els.guidance.classList.toggle('ok', g.ok && passAll);
+  drawWire(det, passAll);
+  if(els.debug.classList.contains('show')) renderDebug(metrics, gates, silent);
+
+  // v68.15.2: MRZ OCR moved to its own dedicated step (see SECTION 7.5's
+  // file comment) -- no longer triggered from here.
+
+  // Rolling diagnostics log — one compact record per processed frame, capped.
+  if(state.logging){
+    state.log.push({ t:Math.round(ts), side:state.side, pass:passAll,
+      m:metrics, g:{...gates}, s:silent });
+    if(state.log.length>400) state.log.shift();
+    els.logBadge.textContent = 'REC '+state.log.length;
+  }
+
+  // Best-frame burst buffer — keep a rolling window of passing frames; also the
+  // shared source for replay/micro-variation analysis (Category 3, server-side).
+  if(passAll){
+    const full = grabFullFrame();
+    state.burst.push({ dataUrl:full.dataUrl, sharpness:res.sharp, ts, silent, moireFull:full.moireFull, luma:metrics.meanLuma, banding:silent.banding, hash:silent.hash, barcodeRegionHash:full.barcodeRegionHash });
+    if(state.burst.length>CONFIG.burstWindow) state.burst.shift();
+    state.stableCount++;
+    if(state.stableCount>=CONFIG.stabilityFrames){
+      lockSide();
+    }
+  }else{
+    state.stableCount=0;
+    state.burst.length=0;
+  }
+}
+
+// Perceptual hash of the barcode's expected region within a FULL-RES back
+// shot (the wide, not-zoomed-in image), so a later close-up crop can be
+// checked against it — see computeBarcodeVisualMatch() and its call sites.
+// cardRect() is a pure function of frame dimensions (the fixed on-screen
+// guide rectangle, not a live-detected box), so the exact same geometry
+// cropGuideRegion() uses during the barcode step can be reapplied here to
+// the wide shot with no stored detection state needed.
+function barcodeGuideRegionHash(ctx, vw, vh){
+  try{
+    const card=cardRect({width:vw,height:vh});
+    const g=BARCODE_GUIDE;
+    const bx0=Math.max(0,Math.round(card.x0+g.fx0*card.gw)), by0=Math.max(0,Math.round(card.y0+g.fy0*card.gh));
+    const bx1=Math.min(vw,Math.round(card.x0+g.fx1*card.gw)), by1=Math.min(vh,Math.round(card.y0+g.fy1*card.gh));
+    const bw=bx1-bx0, bh=by1-by0;
+    if(bw<8||bh<8) return null;
+    const region=ctx.getImageData(bx0,by0,bw,bh);
+    return aHash(toGray(region.data,bw,bh),bw,bh);
+  }catch(e){ return null; }
+}
+// Compares a barcode close-up CANVAS against the wide back shot's own
+// barcode-region hash (stashed on state.silent.back.barcodeGuideRegionHash
+// by lockSide() when the back step locked) — Erik's ask: make sure the
+// close-up crop and the wide shot are actually showing the same barcode,
+// not two different cards. 64-bit aHash, so 0 = identical, 32 = no
+// correlation (random chance), 64 = fully inverted. Stored on state so
+// buildPayload() (which runs synchronously, well after this) can read it
+// without needing to be made async — this function itself is synchronous
+// too: both hashes come from canvases/ImageData already in memory, no
+// image reload needed.
+function computeBarcodeVisualMatch(closeCanvas){
+  try{
+    const wideHash = state.silent.back && state.silent.back.barcodeGuideRegionHash;
+    if(!wideHash || !closeCanvas) { state.barcodeCropVisualMatch = null; return; }
+    const cw=closeCanvas.width, ch=closeCanvas.height;
+    if(cw<8||ch<8) { state.barcodeCropVisualMatch = null; return; }
+    const data = closeCanvas.getContext('2d').getImageData(0,0,cw,ch).data;
+    const closeHash = aHash(toGray(data,cw,ch),cw,ch);
+    const dist = hexHashHammingDistance(wideHash, closeHash);
+    const maxBits = wideHash.length * 4; // each hex char = 4 bits (aHash is 64 hex chars = 256 bits, not 64)
+    state.barcodeCropVisualMatch = dist==null ? null : {
+      hammingDistance: dist, maxBits,
+      similarity: +(1-dist/maxBits).toFixed(3),
+      wideHash, closeHash,
+    };
+  }catch(e){ state.barcodeCropVisualMatch = null; }
+}
+function grabFullFrame(){
+  const vw=els.video.videoWidth, vh=els.video.videoHeight;
+  capCanvas.width=vw; capCanvas.height=vh;
+  capCtx.drawImage(els.video,0,0,vw,vh);
+  // Back image passed at full quality — never resized (PDF417 needs the detail;
+  // this mirrors the app's v36 fix that stopped downscaling the back image).
+  const q = state.side==='back' ? 0.98 : 0.92;
+  // FULL-RESOLUTION moiré. Screen-recapture interference is a HIGH-frequency
+  // pixel-grid pattern; measuring it on the 480px analysis frame low-pass
+  // filtered away the very signal it exists to detect (v14 scored a MacBook
+  // screen recapture identically to genuine cards). Measure on a native-res
+  // band instead. Silent — never surfaced to the user.
+  let moireFull=null;
+  try{
+    const by0=Math.round(vh*0.40), bh=Math.max(8, Math.min(Math.round(vh*0.20), vh-by0));
+    const band=capCtx.getImageData(0,by0,vw,bh);
+    moireFull=+moireScore(toGray(band.data,vw,bh),vw,bh).toFixed(3);
+  }catch(_){}
+  const barcodeRegionHash = state.side==='back' ? barcodeGuideRegionHash(capCtx,vw,vh) : null;
+  return { dataUrl: capCanvas.toDataURL('image/jpeg', q), moireFull, barcodeRegionHash };
+}
+
+function lockSide(){
+  // Pick the sharpest frame from the burst (best-frame selection).
+  let best=state.burst[0];
+  for(const f of state.burst) if(f.sharpness>best.sharpness) best=f;
+  // Replay/repetition proxy over the burst (Category 3 seed): how much the
+  // sharpness varied frame-to-frame. A real hand-held card jitters; a looped
+  // video/static replay is suspiciously uniform. Full frame-hash comparison is
+  // the server-side job — this just carries the raw variation forward.
+  const cov=(arr)=>{ if(!arr.length) return 0; const m=arr.reduce((a,b)=>a+b,0)/arr.length;
+    if(!m) return 0; const v=arr.reduce((a,b)=>a+(b-m)*(b-m),0)/arr.length; return Math.sqrt(v)/m; };
+  const sharpVals=state.burst.map(f=>f.sharpness);
+  const mean=sharpVals.reduce((a,b)=>a+b,0)/sharpVals.length;
+  const variance=sharpVals.reduce((a,b)=>a+(b-mean)*(b-mean),0)/sharpVals.length;
+
+  state.captured[state.side] = best.dataUrl;
+  state.silent[state.side] = {
+    ...best.silent,
+    burstFrames: state.burst.length,
+    sharpnessVariance: +variance.toFixed(1),
+    moireScoreFullRes: best.moireFull,   // measured, NOT gated: proved non-discriminating on a Retina panel
+    // Normalized temporal signals. Raw variance scales with mean sharpness and
+    // is confounded by hand motion; coefficient of variation is scale-free, so
+    // it isolates the frame-to-frame FLICKER that photographing a display adds.
+    sharpnessCoV: +cov(sharpVals).toFixed(3),
+    lumaCoV: +cov(state.burst.map(f=>f.luma||0)).toFixed(4),
+    bandingPeak: +Math.max.apply(null, state.burst.map(f=>f.banding||0)).toFixed(2),
+    frameHashes: state.burst.map(f=>f.hash),
+    distinctFrameRatio: +(new Set(state.burst.map(f=>f.hash)).size/state.burst.length).toFixed(3),
+    // Perceptual hash of the WIDE shot's barcode-guide region (back side
+    // only), from the same locked/winning frame the wide image itself came
+    // from. Compared against the close-up crop's own hash once the barcode
+    // step runs — see computeBarcodeVisualMatch().
+    barcodeGuideRegionHash: best.barcodeRegionHash || null,
+  };
+
+  fireFlash();
+  state.stableCount=0; state.burst.length=0;
+
+  if(state.side==='front'){
+    beginTiltStep();
+  }else if(state.side==='back'){
+    beginBarcodeStep();
+  }else{
+    finish();
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 6 — OVERLAY DRAWING
+   ════════════════════════════════════════════════════════════════════════ */
+// Size + position the overlay canvas to EXACTLY cover the video's on-screen
+// content rectangle, accounting for object-fit letterboxing. Previously the
+// canvas was pinned to the whole cam-area (inset:0) while the video was
+// letterboxed inside it — so the guide was drawn in the wrong place (and looked
+// like it wasn't drawn at all). This is the fix for "no visible guide box."
+function layoutOverlay(){
+  const vw=els.video.videoWidth, vh=els.video.videoHeight;
+  if(!vw||!vh) return false;
+  const area=els.camArea.getBoundingClientRect();
+  const vidAR=vw/vh, areaAR=area.width/area.height;
+  let cw,ch,ox,oy;
+  if(vidAR>areaAR){ cw=area.width; ch=area.width/vidAR; ox=0; oy=(area.height-ch)/2; }
+  else            { ch=area.height; cw=area.height*vidAR; oy=0; ox=(area.width-cw)/2; }
+  const c=els.overlay, dpr=window.devicePixelRatio||1;
+  const pxW=Math.round(cw*dpr), pxH=Math.round(ch*dpr);
+  // Only resize when it actually changed (resizing clears the canvas).
+  if(c.width!==pxW||c.height!==pxH){ c.width=pxW; c.height=pxH; }
+  c.style.left=ox+'px'; c.style.top=oy+'px'; c.style.width=cw+'px'; c.style.height=ch+'px';
+  return true;
+}
+function mapGuideToDisplay(guide){
+  // analysis-space (480 wide) -> canvas pixels. Uniform scale (same video AR).
+  const c=els.overlay;
+  const s=c.width / CONFIG.analysisWidth;
+  return { x0:guide.x0*s, y0:guide.y0*s, x1:guide.x1*s, y1:guide.y1*s };
+}
+let lastDet=null, lastPass=false;
+function drawWire(det, pass){ lastDet=det; lastPass=pass; paintGuide(); }
+// The ID-1 card rectangle as it's actually framed within the overlay — used
+// by both the document viewfinder AND the barcode guide below, so the
+// barcode box stays positioned relative to the CARD rather than the raw
+// canvas. layoutOverlay() already makes the overlay's own aspect ratio match
+// the video feed's, which varies a lot device to device (phone vs laptop
+// webcam); anything sized as a flat fraction of the whole canvas silently
+// drifts out of place whenever that ratio changes. This is what "card rect,
+// not canvas rect" fixes.
+function cardRect(c){
+  const gw=Math.min(c.width*0.86, c.height*0.86*CONFIG.aspectRatio);
+  const gh=gw/CONFIG.aspectRatio;
+  const x0=(c.width-gw)/2, y0=(c.height-gh)/2;
+  return {x0,y0,gw,gh};
+}
+// Persistent viewfinder frame — always drawn FIRST so it can never "disappear",
+// even if a later drawing step errors. Bright and unmistakable.
+function drawViewfinder(ctx, c, colour, dash){
+  const {x0,y0,gw,gh}=cardRect(c);
+  ctx.strokeStyle=colour; ctx.lineWidth=Math.max(3,c.width*0.008);
+  ctx.setLineDash(dash?[16,12]:[]);
+  ctx.strokeRect(x0,y0,gw,gh);
+  ctx.setLineDash([]);
+  // bold corner brackets so the target reads instantly on a busy background
+  ctx.lineWidth=Math.max(4,c.width*0.013);
+  const L=Math.min(52,gw*0.16);
+  for(const [x,y,dx,dy] of [[x0,y0,1,1],[x0+gw,y0,-1,1],[x0,y0+gh,1,-1],[x0+gw,y0+gh,-1,-1]]){
+    ctx.beginPath(); ctx.moveTo(x,y+dy*L); ctx.lineTo(x,y); ctx.lineTo(x+dx*L,y); ctx.stroke();
+  }
+  return {x0,y0,x1:x0+gw,y1:y0+gh};
+}
+function paintGuide(){
+  const c=els.overlay, ctx=c.getContext('2d');
+  ctx.clearRect(0,0,c.width,c.height);
+  const css=getComputedStyle(document.documentElement);
+  const green=css.getPropertyValue('--green').trim();
+  const amber=css.getPropertyValue('--accent').trim();
+  const red=css.getPropertyValue('--red').trim();
+
+  const detected = lastDet && !lastDet.lowContrast;
+  const locked = detected && lastPass;
+
+  // Always draw the viewfinder unless we've locked (then the green box is the star).
+  if(!locked){
+    const vfCol = (lastDet && lastDet.lowContrast) ? red : amber;
+    const vf = drawViewfinder(ctx, c, vfCol, true);
+    // status text under the frame
+    ctx.textAlign='center'; ctx.textBaseline='top';
+    if(lastDet && lastDet.lowContrast){
+      ctx.fillStyle=red;
+      ctx.font=`700 ${Math.max(12,c.width*0.022)}px 'JetBrains Mono',monospace`;
+      ctx.fillText('LOW CONTRAST', c.width/2, vf.y1+10);
+      ctx.fillStyle='rgba(232,240,248,0.85)';
+      ctx.font=`600 ${Math.max(10,c.width*0.016)}px 'JetBrains Mono',monospace`;
+      ctx.fillText('use a plainer / darker background', c.width/2, vf.y1+10+Math.max(16,c.width*0.028));
+    }else if(!detected){
+      ctx.fillStyle='rgba(232,240,248,0.85)';
+      ctx.font=`600 ${Math.max(11,c.width*0.02)}px 'JetBrains Mono',monospace`;
+      ctx.fillText('SHOW YOUR ID IN THE FRAME', c.width/2, vf.y1+10);
+    }
+  }
+
+  // Overlay the live detection wireframe on top when a card is actually found.
+  if(detected){
+    const gd=mapGuideToDisplay(lastDet);
+    const col = locked ? green : amber;
+    ctx.strokeStyle=col; ctx.lineWidth=Math.max(3,c.width*0.007);
+    ctx.setLineDash(locked?[]:[10,7]);
+    ctx.strokeRect(gd.x0,gd.y0,gd.x1-gd.x0,gd.y1-gd.y0);
+    ctx.setLineDash([]);
+    ctx.lineWidth=Math.max(3,c.width*0.011);
+    const L=Math.min(42,(gd.x1-gd.x0)*0.15);
+    for(const [x,y,dx,dy] of [[gd.x0,gd.y0,1,1],[gd.x1,gd.y0,-1,1],[gd.x0,gd.y1,1,-1],[gd.x1,gd.y1,-1,-1]]){
+      ctx.beginPath(); ctx.moveTo(x,y+dy*L); ctx.lineTo(x,y); ctx.lineTo(x+dx*L,y); ctx.stroke();
+    }
+    ctx.font=`700 ${Math.max(11,c.width*0.017)}px 'JetBrains Mono',monospace`;
+    ctx.textAlign='left'; ctx.textBaseline='bottom'; ctx.fillStyle=col;
+    ctx.fillText(locked?'CARD LOCKED':'CARD DETECTED', gd.x0, Math.max(16, gd.y0-6));
+    if(state.side==='tilt') drawTiltProgress(ctx,c);
+    if(state.side==='back'){
+      const by0=gd.y0+(gd.y1-gd.y0)*0.56, by1=gd.y1-(gd.y1-gd.y0)*0.08;
+      const bx0=gd.x0+(gd.x1-gd.x0)*0.08, bx1=gd.x1-(gd.x1-gd.x0)*0.08;
+      ctx.strokeStyle = state.barcodeResult ? green : 'rgba(232,160,32,0.7)';
+      ctx.lineWidth=2; ctx.setLineDash([6,4]);
+      ctx.strokeRect(bx0,by0,bx1-bx0,by1-by0); ctx.setLineDash([]);
+    }
+  }
+}
+
+function renderChips(gates){
+  const labels={sharpness:'Focus',glare:'Glare',exposure:'Exposure',contrast:'Contrast',
+    boundary:'In frame',distance:'Distance',skew:'Level',obstruction:'Unobstructed',
+    colorCast:'Colour',barcode:'Barcode'};
+  const order=['boundary','distance','skew','sharpness','glare','exposure','contrast','colorCast','obstruction','barcode'];
+  let html='';
+  for(const k of order){
+    if(!(k in gates)) continue;
+    html+=`<span class="chip ${gates[k]?'pass':'fail'}">${labels[k]}</span>`;
+  }
+  els.chips.innerHTML=html;
+}
+
+function renderDebug(metrics, gates, silent){
+  const t=CONFIG.gates;
+  const rows=[
+    ['detected', metrics.detected?'YES':(metrics.lowContrast?'low-contrast':'no'), '', metrics.detected],
+    ['separation', metrics.separation!==undefined?metrics.separation:'—', `≥${t.sepConfident}`, metrics.detected],
+    ['widthFrac',metrics.widthFrac,`${t.distWidthMin}–${t.distWidthMax}`,gates.distance],
+    ['aspect',metrics.aspect,`${t.aspectMin}–${t.aspectMax}`,gates.boundary],
+    ['marginMin',metrics.marginMin,`≥${t.inFrameMargin}`,gates.boundary],
+    ['skew°',metrics.skew,`±${t.skewMaxDeg}`,gates.skew],
+    ['sharpness',metrics.sharp,`≥${t.sharpnessMin}`,gates.sharpness],
+    ['meanLuma',metrics.meanLuma,`${t.meanLumaMin}–${t.meanLumaMax}`,gates.exposure],
+    ['blownFrac',metrics.blownFrac,`≤${t.glareMaxFrac}`,gates.glare],
+    ['darkFrac',metrics.darkFrac,`≤${t.underExpMaxFrac}`,gates.exposure],
+    ['contrast',metrics.contrast,`≥${t.contrastMinStd}`,gates.contrast],
+    ['colorCast',metrics.cast,`≤${t.colorCastMaxRatio}`,gates.colorCast],
+    ['obstruction',metrics.obstruction,`≤${t.obstructionMaxFrac}`,gates.obstruction],
+    ['obsTexture',metrics.obsTexture,`<${t.obstructionTextureMax}=smooth`,gates.obstruction],
+  ];
+  if('barcode' in gates) rows.push(['barcode',state.barcodeResult?'decoded':'—','decode',gates.barcode]);
+  els.debugCat1.innerHTML = rows.map(([k,v,thr,ok])=>
+    `<div class="dbg-row"><span class="dbg-k">${k}</span><span class="dbg-v ${ok?'pass':'fail'}">${v} <span style="opacity:.5">${thr}</span></span></div>`).join('');
+  const dev=state.deviceSignal||{};
+  els.debugCat2.innerHTML =
+    `<div class="dbg-row"><span class="dbg-k">moiré</span><span class="dbg-v">${silent.moireScore}</span></div>`+
+    `<div class="dbg-row"><span class="dbg-k">bezel</span><span class="dbg-v">${silent.bezelScore}</span></div>`+
+    `<div class="dbg-row"><span class="dbg-k">virtualCam</span><span class="dbg-v ${dev.virtualCameraSuspected?'fail':'pass'}">${dev.virtualCameraSuspected?dev.matchedName:'none'}</span></div>`;
+}
+
+function fireFlash(){ els.flash.classList.remove('fire'); void els.flash.offsetWidth; els.flash.classList.add('fire'); }
+
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 7 — BARCODE (ZXing CODE 39, back side)
+   v68.15.2: this whole section is inherited near-verbatim from the DL file's
+   PDF417 version -- the geometry/presence heuristics (wide+short block
+   detection, guide-region cropping) were tuned against PDF417 but are
+   generic enough to also work as an aiming/presence aid for a Code 39
+   symbol (also a linear, wide-short barcode). Only the actual DECODE
+   target (ZXing hints/formats, just below) needed to change. Comments
+   elsewhere in this section that still say "PDF417" are describing that
+   original tuning history, which remains accurate context even here.
+   ════════════════════════════════════════════════════════════════════════ */
+function initBarcodeReader(){
+  try{
+    const hints=new Map();
+    const ZX=window.ZXing;
+    // v68.15.2: CODE_39, not PDF_417 -- the passport card's back-of-card
+    // barcode is a Code 39 ("3 of 9") symbol encoding the card's own serial
+    // number, a completely different symbology from a DL's PDF417.
+    hints.set(ZX.DecodeHintType.POSSIBLE_FORMATS, [ZX.BarcodeFormat.CODE_39]);
+    hints.set(ZX.DecodeHintType.TRY_HARDER, true);
+    state.barcodeReader = new ZX.MultiFormatReader();
+    state.barcodeReader.setHints(hints);
+  }catch(e){ console.warn('ZXing init failed:', e.message); }
+}
+function tryDecodeBarcode(){
+  if(!state.barcodeReader || !window.ZXing){ state.barcodeZxingLoaded=false; return; }
+  state.barcodeZxingLoaded=true;
+  const vw=els.video.videoWidth, vh=els.video.videoHeight;
+  if(!vw) return;
+  state.barcodeAttempts=(state.barcodeAttempts||0)+1;
+  const ZX=window.ZXing;
+
+  // Crop tightly to the DETECTED card's lower barcode band, at FULL resolution.
+  // Scanning the whole 1080x1920 frame was the problem — ZXing couldn't lock the
+  // PDF417 amid all the other content. A clean, high-res crop of just the barcode
+  // strip is what it needs (this is the same lesson as the app's v36 back-image fix).
+  let cx0=0,cy0=0,cw=vw,ch=vh;
+  if(lastDet && !lastDet.lowContrast){
+    const s=vw/CONFIG.analysisWidth;
+    const dx0=lastDet.x0*s, dx1=lastDet.x1*s, dy0=lastDet.y0*s, dy1=lastDet.y1*s;
+    const dh=dy1-dy0;
+    cx0=Math.max(0, dx0 - (dx1-dx0)*0.03);
+    cw =Math.min(vw-cx0, (dx1-dx0)*1.06);
+    cy0=Math.max(0, dy0 + dh*0.42);        // barcode sits in the lower ~half of the card
+    ch =Math.min(vh-cy0, dh*0.62);
+  }
+  const c=document.createElement('canvas'); c.width=Math.round(cw); c.height=Math.round(ch);
+  c.getContext('2d').drawImage(els.video, cx0,cy0,cw,ch, 0,0,c.width,c.height);
+  state.barcodeCrop = `${c.width}x${c.height}`;
+
+  // Try more than one binarization per cycle — laminated barcodes often decode
+  // under one thresholding but not another.
+  const mkBitmaps=[
+    ()=> new ZX.BinaryBitmap(new ZX.HybridBinarizer(new ZX.HTMLCanvasElementLuminanceSource(c))),
+    ()=> new ZX.BinaryBitmap(new ZX.GlobalHistogramBinarizer(new ZX.HTMLCanvasElementLuminanceSource(c))),
+  ];
+  for(const mk of mkBitmaps){
+    try{
+      const result=state.barcodeReader.decode(mk());
+      if(result && result.getText()){ state.barcodeResult=result.getText(); state.barcodeLastErr=null; return; }
+    }catch(e){ state.barcodeLastErr = e && (e.name||e.message) || 'NotFound'; }
+    finally{ try{ state.barcodeReader.reset(); }catch(_){} }
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 7.5 — MRZ (TD1) — PASSPORT CARD ONLY
+   ════════════════════════════════════════════════════════════════════════
+   v68.15.2 shipped this as a best-effort SIDE CHANNEL squeezed into the
+   normal 'back' step's dwell time. REAL-DEVICE FAILURE (Erik, v68.15.2):
+   barcode decode and every capture-quality signal succeeded cleanly, but
+   MRZ Read came back "Not parsed" on every session. Root cause: the
+   'back' step locks itself the moment 6 consecutive frames pass the
+   quality gates -- roughly 2-2.5s including the fixed 1.8s flip-hold
+   (BACK_FLIP_HOLD_MS) -- and Tesseract's recognize() call alone often
+   takes several hundred ms to over a second. That leaves time for at
+   most one real OCR attempt before the step advances to 'barcode', after
+   which the side channel's own `state.side==='back'` guard stops firing
+   entirely -- exactly the same problem that motivated giving the barcode
+   its own dedicated step in the first place (see beginBarcodeStep()'s
+   settle-window + repeated-attempts + bounded-timeout design just above).
+   MRZ needed that same treatment and wasn't getting it.
+
+   v68.15.2 FIX: MRZ is now its own dedicated step (state.side==='mrz'),
+   sequenced Back -> Barcode -> MRZ -> Finish -- deliberately AFTER the
+   barcode step, not between back and barcode. Erik's call: the MRZ guide
+   box (a near-full-width band hugging the bottom edge) and the barcode
+   guide box (BARCODE_GUIDE's centered lower-middle band) are visually
+   quite different targets, and chaining two different closeup guides
+   back-to-back right after the wide 'back' shot reads as less confusing
+   than interleaving a third shape in between -- worth a little extra
+   repositioning motion. See beginMrzStep()/mrzStepTick()/paintMrzGuide()/
+   cropMrzGuideRegion() below, which mirror beginBarcodeStep()'s pattern
+   directly rather than introducing a new one. Still a best-effort read,
+   not a hard gate on submission -- an unreadable MRZ times out
+   (MRZ_MAX_MS) into finish() the same honest-proxy way an unreadable
+   barcode already did, rather than trapping the applicant in the step.
+
+   The parser/check-digit math below (mrzCharValue through mrzResultIsValid)
+   is PORTED VERBATIM from safe_idv_capture_passport_v70.html (the
+   booklet file), unaffected by this fix -- it was already built and
+   hand-verified against the ICAO 9303 TD1 spec for the booklet's own MRZ
+   (a different physical location -- book photo page -- but the identical
+   TD1/TD2/TD3 text format and check-digit algorithm).
+
+   v68.15.3: the dedicated step from v68.15.2 ran correctly (confirmed via
+   the newly-added OCR ATTEMPTS telemetry: a real device logged 19 attempts
+   across the full MRZ_MAX_MS window) but STILL never got a valid read.
+   Erik's report included the newly-added MRZ Closeup image for the first
+   time, and it showed why: the crop was landing almost entirely on the
+   barcode and the eagle-seal artwork above it, with only a sliver of real
+   MRZ text clipped at the very bottom edge -- "it seemed to prefer the
+   barcode," in Erik's words. Root cause, worked out from that image plus
+   the two guides' own math: BARCODE_GUIDE's padded decode region (padY=
+   0.35 on a fy0:0.33-fy1:0.67 band) and MRZ_GUIDE's padded region (the old
+   padY=0.25 on a fy0:0.72-fy1:0.98 band) OVERLAPPED by a wide margin even
+   in the ideal case -- the static fy0=0.72 guess for where the MRZ starts
+   simply wasn't far enough below where the barcode's own padded crop
+   already reached. And the real MRZ text turned out to sit lower than
+   fy1=0.98 predicted, so what little of it should have been visible was
+   getting clipped at the crop's bottom edge too.
+
+   FIX, in two parts:
+   1. Ground truth over guesswork. The barcode step already proves exactly
+      where the barcode sits on THIS card (decodeCanvas()'s reported corner
+      points, the same geometry cropAroundPoints() uses to save a provably-
+      correct barcode closeup). barcodeStepTick()'s success handler now also
+      records that as state.barcodeBottomFrac -- the barcode's own bottom
+      edge, as a fraction of cardRect()'s height. effectiveMrzFy0() uses
+      that (when available) as a FLOOR on the MRZ band's top edge, instead
+      of trusting MRZ_GUIDE.fy0 blindly: the MRZ crop now can never start
+      above where we just proved the barcode actually ends, regardless of
+      how this particular card happened to be framed. Falls back to the old
+      static fy0=0.72 when no barcode geometry was captured (e.g. the
+      barcode step itself timed out unread). paintMrzGuide() calls the same
+      effectiveMrzFy0(), so the on-screen box always matches what
+      cropMrzGuideRegion() is actually reading -- a static visual guide next
+      to a dynamically-anchored crop would just be a different flavor of
+      the same bug.
+   2. Padding is now asymmetric, not equal on both sides like before. The
+      top edge is now either a tuned fraction or a ground-truth anchor, so
+      it needs little slack (padTop, 15% of band height). The bottom edge
+      is still a guess against cardRect()'s idealized box, and the evidence
+      above showed it needs MORE room, not less (padBottom, 55%).
+
+   Also updated the settle-window and prompt copy: Erik's other observation
+   ("happened so quickly I couldn't reposition") pointed at a UX mismatch as
+   real as the geometry one -- the guide box changing shape between steps
+   reads as an instruction to move the physical card, when the design has
+   always assumed the SAME static card position, just a different band of
+   it. Cost nothing to say so explicitly.
+   ════════════════════════════════════════════════════════════════════════ */
+const TESSERACT_CDN = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+const TESSERACT_MODEL_FALLBACK = 'eng'; // stock model, loaded from Tesseract's own CDN language-data if the custom one 404s
+let tesseractWorker = null;
+let usingFallbackModel = false;
+let mrzOcrAttempts = 0;
+let mrzOcrInFlight = false;
+let mrzResult = null;
+let lastMrzOcrRawText = '';
+const MRZ_OCR_INTERVAL_MS = 900;
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src; s.onload = resolve; s.onerror = () => reject(new Error('failed to load ' + src));
+    document.head.appendChild(s);
+  });
+}
+
+// Ported verbatim from safe_idv_capture_passport_v70.html -- see that
+// file's own comment: authored from scratch against the published ICAO
+// 9303 spec (fixed field positions + weighted check-digit algorithm), not
+// copied from any single source file.
+function mrzCharValue(ch) {
+  if (ch >= '0' && ch <= '9') return ch.charCodeAt(0) - 48;
+  if (ch >= 'A' && ch <= 'Z') return ch.charCodeAt(0) - 55; // A=10 .. Z=35
+  return 0; // '<' and anything unexpected
+}
+function calculateCheckDigit(input) {
+  const weights = [7, 3, 1];
+  let sum = 0;
+  for (let i = 0; i < input.length; i++) {
+    sum += mrzCharValue(input[i]) * weights[i % 3];
+  }
+  return sum % 10;
+}
+function checkDigitOk(field, expectedDigit) {
+  if (expectedDigit === '<' || expectedDigit === '') return null; // not present on this document
+  const expected = parseInt(expectedDigit, 10);
+  if (Number.isNaN(expected)) return false;
+  return calculateCheckDigit(field) === expected;
+}
+function splitName(nameField) {
+  const parts = nameField.split('<<');
+  const surname = (parts[0] || '').replace(/</g, ' ').trim();
+  const given = (parts[1] || '').replace(/</g, ' ').trim();
+  return { surname, given };
+}
+function parseTD3(mrz) {
+  const line1 = mrz.slice(0, 44);
+  const line2 = mrz.slice(44, 88);
+  const { surname, given } = splitName(line1.slice(5).replace(/<+$/,''));
+  const docNumber = line2.slice(0, 9).replace(/<+$/, '');
+  const docNumberCheck = line2[9];
+  const nationality = line2.slice(10, 13);
+  const dob = line2.slice(13, 19);
+  const dobCheck = line2[19];
+  const gender = line2[20];
+  const expiry = line2.slice(21, 27);
+  const expiryCheck = line2[27];
+  const personalNumber = line2.slice(28, 42).replace(/<+$/, '');
+  const personalNumberCheck = line2[42];
+  const compositeCheck = line2[43];
+  const compositeInput = line2.slice(0,10) + line2.slice(13,20) + line2.slice(21,43);
+  return {
+    format: 'TD3', documentTypeCode: line1[0], issuingCountry: line1.slice(2,5),
+    surname, givenNames: given, documentNumber: docNumber, nationality, dateOfBirth: dob,
+    gender, expirationDate: expiry, personalNumber,
+    checks: {
+      documentNumber: checkDigitOk(line2.slice(0,9), docNumberCheck),
+      dateOfBirth: checkDigitOk(dob, dobCheck),
+      expirationDate: checkDigitOk(expiry, expiryCheck),
+      personalNumber: personalNumber ? checkDigitOk(line2.slice(28,42), personalNumberCheck) : null,
+      composite: checkDigitOk(compositeInput, compositeCheck),
+    },
+  };
+}
+function parseTD2(mrz) {
+  const line1 = mrz.slice(0, 36);
+  const line2 = mrz.slice(36, 72);
+  const { surname, given } = splitName(line1.slice(5).replace(/<+$/,''));
+  const docNumber = line2.slice(0, 9).replace(/<+$/, '');
+  const docNumberCheck = line2[9];
+  const nationality = line2.slice(10, 13);
+  const dob = line2.slice(13, 19);
+  const dobCheck = line2[19];
+  const gender = line2[20];
+  const expiry = line2.slice(21, 27);
+  const expiryCheck = line2[27];
+  const optional = line2.slice(28, 35).replace(/<+$/, '');
+  const compositeCheck = line2[35];
+  const compositeInput = line2.slice(0,10) + line2.slice(13,20) + line2.slice(21,35);
+  return {
+    format: 'TD2', documentTypeCode: line1[0], issuingCountry: line1.slice(2,5),
+    surname, givenNames: given, documentNumber: docNumber, nationality, dateOfBirth: dob,
+    gender, expirationDate: expiry, optionalData: optional,
+    checks: {
+      documentNumber: checkDigitOk(line2.slice(0,9), docNumberCheck),
+      dateOfBirth: checkDigitOk(dob, dobCheck),
+      expirationDate: checkDigitOk(expiry, expiryCheck),
+      composite: checkDigitOk(compositeInput, compositeCheck),
+    },
+  };
+}
+// TD1 is the format actually expected on a passport card's back (3 lines
+// x 30 chars = 90 total) -- TD2/TD3 are kept alongside it purely so
+// parseMrz()'s length dispatch degrades sensibly rather than crashing if
+// OCR noise or a misidentified document ever produces a different length.
+function parseTD1(mrz) {
+  const line1 = mrz.slice(0, 30);
+  const line2 = mrz.slice(30, 60);
+  const line3 = mrz.slice(60, 90);
+  const docNumber = line1.slice(5, 14).replace(/<+$/, '');
+  const docNumberCheck = line1[14];
+  const dob = line2.slice(0, 6);
+  const dobCheck = line2[6];
+  const gender = line2[7];
+  const expiry = line2.slice(8, 14);
+  const expiryCheck = line2[14];
+  const nationality = line2.slice(15, 18);
+  const optional = line2.slice(18, 29).replace(/<+$/, '');
+  const compositeCheck = line2[29];
+  const { surname, given } = splitName(line3.replace(/<+$/,''));
+  const compositeInput = line1.slice(5,30) + line2.slice(0,7) + line2.slice(8,15) + line2.slice(18,29);
+  return {
+    format: 'TD1', documentTypeCode: line1[0], issuingCountry: line1.slice(2,5),
+    surname, givenNames: given, documentNumber: docNumber, nationality, dateOfBirth: dob,
+    gender, expirationDate: expiry, optionalData: optional,
+    checks: {
+      documentNumber: checkDigitOk(docNumber, docNumberCheck),
+      dateOfBirth: checkDigitOk(dob, dobCheck),
+      expirationDate: checkDigitOk(expiry, expiryCheck),
+      composite: checkDigitOk(compositeInput, compositeCheck),
+    },
+  };
+}
+function parseMrz(rawText) {
+  const cleaned = rawText.toUpperCase().replace(/[^A-Z0-9<\n]/g, '').replace(/\n+/g, '');
+  if (cleaned.length === 90) return parseTD1(cleaned);
+  if (cleaned.length === 72) return parseTD2(cleaned);
+  if (cleaned.length === 88) return parseTD3(cleaned);
+  return null; // doesn't match any known format length -- treat as a failed read, not a crash
+}
+function mrzResultIsValid(parsed) {
+  if (!parsed) return false;
+  const c = parsed.checks;
+  return Object.values(c).every(v => v === null || v === true);
+}
+
+async function initTesseract() {
+  await loadScript(TESSERACT_CDN);
+  const pageDir = window.location.href.replace(/\/[^\/]*$/, '');
+  try {
+    tesseractWorker = await Tesseract.createWorker('mrz', 1, {
+      langPath: pageDir,
+      gzip: true,
+      cacheMethod: 'none',
+    });
+    usingFallbackModel = false;
+  } catch (e) {
+    tesseractWorker = await Tesseract.createWorker(TESSERACT_MODEL_FALLBACK);
+    usingFallbackModel = true;
+  }
+  await tesseractWorker.setParameters({
+    tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<',
+  });
+}
+
+// MRZ guide box: a near-full-width band hugging the bottom edge of the
+// on-screen card outline -- ICAO 9303's TD1 layout puts the 3-line MRZ in
+// roughly the bottom quarter of a card's back face. Anchored to cardRect()
+// (the SAME static on-screen guide the barcode step uses), not a live
+// per-frame detection -- this is a dedicated closeup step now, so it gets
+// the same "static aiming box" treatment as BARCODE_GUIDE, not the
+// dynamic-detection approach the old side-channel version used.
+const MRZ_GUIDE = {fx0:0.04, fy0:0.72, fx1:0.96, fy1:0.98};
+const MRZ_SETTLE_MS = 1400;
+const MRZ_MAX_MS = 20000;
+const MRZ_TIPS = ['Fill the guide with the last 3 lines of text','Hold the card steady -- don’t move it','Move a little closer','Reduce glare on the card'];
+
+// v68.15.3: MRZ_GUIDE.fy0 alone is a static ICAO-9303 estimate ("MRZ sits in
+// roughly the bottom quarter"), and two real-device reports showed it wasn't
+// tight enough -- the crop it produced still landed mostly on the barcode
+// above it. When the barcode step just proved (via its own decode geometry)
+// where the barcode's real bottom edge sits on THIS card, that beats the
+// static guess: never start the MRZ band above it. Shared by both
+// cropMrzGuideRegion() (the actual OCR input) and paintMrzGuide() (the
+// on-screen box) so what the user aims at always matches what gets read.
+function effectiveMrzFy0(){
+  const g=MRZ_GUIDE;
+  let fy0=g.fy0;
+  if(typeof state.barcodeBottomFrac==='number'){
+    fy0=Math.max(fy0, state.barcodeBottomFrac+0.04);
+    fy0=Math.min(fy0, g.fy1-0.08); // never collapse/invert the band
+  }
+  return fy0;
+}
+
+// Same card-relative anchoring as cropGuideRegion() (the barcode step's
+// crop) just above -- if this drifted out of sync with the on-screen box,
+// the visible guide would lie about what's being read. Crops at FULL
+// video resolution (not the 480px analysis frame this file uses
+// elsewhere) and upscales 2x -- fine OCR-B character strokes need real
+// pixel detail, same reasoning as the booklet file's getMrzRegionCanvas().
+function cropMrzGuideRegion() {
+  const vw = els.video.videoWidth, vh = els.video.videoHeight;
+  if (!vw) return null;
+  const g = MRZ_GUIDE;
+  const card = cardRect({width:vw, height:vh});
+  const mx0 = card.x0 + g.fx0*card.gw, mx1 = card.x0 + g.fx1*card.gw;
+  const my0 = card.y0 + effectiveMrzFy0()*card.gh, my1 = card.y0 + g.fy1*card.gh;
+  // v68.15.3: padding is now ASYMMETRIC, not the old equal-both-sides split.
+  // The top edge is either the tuned static fraction or a ground-truth
+  // barcode anchor, so it needs little slack. The bottom edge is still a
+  // guess against cardRect()'s idealized box, and the real-device evidence
+  // that motivated this fix showed the true MRZ text sitting lower than
+  // fy1=0.98 predicted -- generous downward slack matters more here than
+  // tight framing.
+  const bandH = my1-my0;
+  const padTop = bandH*0.15, padBottom = bandH*0.55, padX = (mx1-mx0)*0.03;
+  const cx0 = Math.max(0, Math.round(mx0-padX)), cy0 = Math.max(0, Math.round(my0-padTop));
+  const cx1 = Math.min(vw, Math.round(mx1+padX)), cy1 = Math.min(vh, Math.round(my1+padBottom));
+  const cw = cx1-cx0, ch = cy1-cy0;
+  if (cw < 40 || ch < 20) return null;
+  const c = document.createElement('canvas');
+  c.width = cw*2; c.height = ch*2;
+  c.getContext('2d').drawImage(els.video, cx0, cy0, cw, ch, 0, 0, c.width, c.height);
+  return c;
+}
+
+// Takes the canvas to OCR directly (rather than re-cropping internally)
+// so the caller can save the EXACT pixels this attempt read from -- same
+// "what gets saved is provably what was read" discipline as the barcode
+// step's cropAroundPoints()/decodeSource split.
+async function attemptMrzOcr(canvas) {
+  const { data } = await tesseractWorker.recognize(canvas);
+  const text = (data && data.text) ? data.text : '';
+  lastMrzOcrRawText = text; // surfaced in the debug panel for calibration, same as the booklet file
+  const parsed = parseMrz(text);
+  if (parsed && mrzResultIsValid(parsed)) return parsed;
+  return null;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 8 — SIDE / FINISH / PAYLOAD
+   ════════════════════════════════════════════════════════════════════════ */
+function beginSide(side){
+  if(els.tiltDemo) els.tiltDemo.classList.remove('show');
+  state.side=side;
+  state.stableCount=0; state.burst.length=0;
+  state.barcodeResult=null;
+  els.promptSide.textContent = side==='front' ? 'FRONT OF PASSPORT CARD' : 'BACK OF PASSPORT CARD';
+  els.promptMain.textContent = side==='front'
+    ? 'Position the front of your passport card' : 'Now flip to the back';
+  if(side==='back'){ state.backStepStart=performance.now(); if(!state.barcodeReader) initBarcodeReader(); }
+}
+
+function buildPayload(){
+  // This is the object that rides into the /cases request body as
+  // `captureSignals`, alongside the images. Category 1 outcomes are implicit
+  // (a locked side means all quality gates passed). Category 2/3 signals are
+  // carried silently for the backend report.
+  return {
+    schemaVersion: 'autocapture-1',
+    buildVersion: BUILD_VERSION,
+    capturedAt: new Date().toISOString(),
+    // v68.15.2: self-describing, mirrors the booklet passport file's own
+    // captureSignals.docType -- not read by anything client-side (the
+    // report's top-level payload.docType comes from the interview
+    // selection, see safe_idv_report_*.html), but useful for anyone
+    // reading the Raw Response/Request Payload debug panels.
+    docType: 'passport_card',
+    // v68.15.2: MRZ (TD1) OCR telemetry -- see the "MRZ (TD1) — PASSPORT
+    // CARD" section below. Named identically to the booklet file's own
+    // captureSignals.ocrAttempts/mrzOcrModel so the report's existing
+    // MRZ Read/Check Digits/OCR Attempts integrity cards
+    // (mrzIntegrityCardsHtml() in safe_idv_report_*.html) work unmodified.
+    ocrAttempts: mrzOcrAttempts,
+    mrzOcrModel: mrzResult ? (usingFallbackModel ? 'tesseract_fallback_eng' : 'tesseract_custom_ocrb') : null,
+    front: state.silent.front,
+    back: state.silent.back,
+    device: state.deviceSignal ? {
+      virtualCameraSuspected: state.deviceSignal.virtualCameraSuspected,
+      matchedName: state.deviceSignal.matchedName,
+      settings: state.deviceSignal.settings,
+      capabilitiesSuspicious: state.deviceSignal.capabilitiesSuspicious||false,
+    } : null,
+    captureConditions: {
+      whiteBalanceMode: (state.deviceSignal && state.deviceSignal.settings && state.deviceSignal.settings.whiteBalanceMode) || null,
+      front: (state.silent.front && state.silent.front.conditions) || null,
+      back:  (state.silent.back  && state.silent.back.conditions)  || null,
+    },
+    tiltResponse: state.tiltSummary || null,
+    barcode: (function(){
+      // v68.15.2: CODE_39, not PDF_417 -- see initBarcodeReader()'s comment.
+      // The AAMVA-payload sniff below is a DL-only concept (Code 39 here
+      // just encodes a plain serial-number string), so it's dropped
+      // rather than left as dead/misleading logic.
+      if(state.barcodeResult) return { decoded:true, status:'decoded', format:'CODE_39',
+        raw: '[payload present]',
+        savedCropSource: state.lastBarcodeSaveSource || null,
+        // Does the saved close-up crop actually look like the same region as
+        // the wide back shot? Independent of decode success/field matching —
+        // this is purely visual, so it also catches a wrong-region crop that
+        // happens to still be readable. See computeBarcodeVisualMatch().
+        visualMatchToWideShot: state.barcodeCropVisualMatch || null };
+      // Undecodable is a REPORTED RESULT, not a failure to submit. Step 3 saw the
+      // whole card at low resolution and answered "is a barcode there"; step 4
+      // saw it magnified and answered "what does it say". Those probe different
+      // SCALES, so a worn barcode keeps its block structure (presence high) long
+      // after the bars stop resolving (decode fails) — which is exactly the case
+      // worth flagging. Raw numbers ship alongside the label so a reviewer can
+      // second-guess the thresholds.
+      const b=state.silent.back||{};
+      // Calibrated against REAL imagery, not synthetics. A synthetic barcode
+      // scores 0.86, but a genuine PA licence photographed on a palm scored
+      // 0.1757 — so the old 0.35 cutoff reported "no barcode" for a perfectly
+      // readable card, which is precisely the misinformation this flag exists to
+      // prevent. Front-side text measures ~0.00-0.03, so 0.08 separates safely.
+      // (See CONFIG.gates.barcodePresenceConfidentMin's own comment for why
+      // this is deliberately a different, higher number than the live gate's
+      // barcodePresenceMin — not a duplication bug.)
+      const present=(b.barcodePresenceScore||0)>=CONFIG.gates.barcodePresenceConfidentMin;
+      const shaped=b.barcodeRegionAspect!=null && b.barcodeRegionAspect>=1.5 && b.barcodeRegionAspect<=12;
+      return { decoded:false,
+        status: (present||shaped) ? 'present_undecodable' : 'no_barcode_region_found',
+        presenceScore: b.barcodePresenceScore!=null ? b.barcodePresenceScore : null,
+        regionAspect: b.barcodeRegionAspect!=null ? b.barcodeRegionAspect : null,
+        regionWidthFrac: b.barcodeRegionWidthFrac!=null ? b.barcodeRegionWidthFrac : null,
+        attempts: state.barcodeAttempts||0,
+        timedOutMs: state.barcodeUnreadable ? BARCODE_MAX_MS : null,
+        visualMatchToWideShot: state.barcodeCropVisualMatch || null };
+    })(),
+    liveCaptureEnforced: true,   // no manual-upload escape hatch in production
+  };
+}
+
+// ── Tilt / OVI step (physical-presence evidence) ────────────────────────
+const tfCanvas=document.createElement('canvas');
+const tfCtx=tfCanvas.getContext('2d');
+// Retain a few tilt frames so the BACKEND can verify angle response itself
+// rather than trusting client-side metrics — which are the thinnest part of this
+// build. Images travel in the images channel, never in captureSignals: base64 in
+// the signal payload would make it unreadable.
+function grabTiltFrame(){
+  const vw=els.video.videoWidth, vh=els.video.videoHeight;
+  if(!vw) return null;
+  const tw=Math.min(720,vw), th=Math.round(vh*(tw/vw));
+  tfCanvas.width=tw; tfCanvas.height=th;
+  tfCtx.drawImage(els.video,0,0,tw,th);
+  return tfCanvas.toDataURL('image/jpeg',0.8);
+}
+function selectTiltFrames(shots){
+  if(!shots || !shots.length) return [];
+  const s=shots.slice().sort((a,b)=>a.aspect-b.aspect);
+  if(s.length<=3) return s.map(x=>x.img);
+  return [s[0].img, s[Math.floor(s.length/2)].img, s[s.length-1].img];  // widest spread + mid
+}
+
+// v68.15: tilt/OVI gesture video -- mirrors the passport track's opening-
+// gesture video (see safe_idv_capture_passport_v70.html's
+// startOpeningGestureRecording()/stopOpeningGestureRecording() for the full
+// rationale/precedent). Arguably an even better fit here than it was for
+// the passport: the tilt check exists specifically to catch a CONTINUOUS
+// specular sweep as the card's angle changes, which the 3 retained stills
+// above (grabTiltFrame()/selectTiltFrames()) can only sample at 3 discrete
+// angles -- they can't actually show the sweep happening the way a clip
+// can. A reviewer watching the real motion is far more convincing than any
+// numeric proxy (tiltCoverage()'s frac/meanDelta) this file could compute.
+// NOT included in the payload sent to the live IDV engine (see
+// safe_idv_report_v70.html's callIdvEngine()) -- vision APIs take
+// images, not video, so this stays a report-page-only artifact, same as
+// the passport opening-gesture video.
+const TILT_VIDEO_BITRATE = 800000; // ~800kbps, same budget as the passport opening-gesture video
+let tiltGestureRecorder = null;
+let tiltGestureChunks = [];
+let tiltGestureVideo = null;
+let tiltGestureVideoReadyResolve = null;
+let tiltGestureVideoReadyPromise = null;
+
+function pickTiltVideoMimeType() {
+  if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported) return null;
+  // iOS Safari's MediaRecorder support is mp4/h264-first; WebM candidates
+  // included for other browsers this demo might run in.
+  const candidates = ['video/mp4;codecs=avc1', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+  for (const c of candidates) {
+    if (MediaRecorder.isTypeSupported(c)) return c;
+  }
+  return null;
+}
+
+// Starts recording from the SAME state.stream the rest of this file already
+// uses for front/back/barcode capture -- no separate capture pipeline
+// needed. Deliberately fails soft: any unsupported browser, missing
+// MediaRecorder, or thrown error just means no video rides along, never a
+// broken capture flow.
+function startTiltGestureRecording() {
+  tiltGestureVideo = null;
+  tiltGestureChunks = [];
+  tiltGestureVideoReadyPromise = new Promise(resolve => { tiltGestureVideoReadyResolve = resolve; });
+  const mimeType = pickTiltVideoMimeType();
+  if (!mimeType || !state.stream) {
+    tiltGestureVideoReadyResolve();
+    return;
+  }
+  try {
+    tiltGestureRecorder = new MediaRecorder(state.stream, { mimeType, videoBitsPerSecond: TILT_VIDEO_BITRATE });
+    tiltGestureRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) tiltGestureChunks.push(e.data); };
+    tiltGestureRecorder.start();
+  } catch (e) {
+    tiltGestureRecorder = null;
+    console.warn('tilt gesture video start failed:', e.message);
+    tiltGestureVideoReadyResolve();
+  }
+}
+
+// MediaRecorder.stop() finalizes its Blob asynchronously (via onstop, after
+// any last ondataavailable) -- tiltGestureVideoReadyPromise lets finish()
+// wait a bounded amount of time for that instead of racing it. In practice
+// this resolves almost immediately: unlike the passport flow (where the
+// video is needed right at the next step), the tilt step is followed by
+// back-of-card capture and the barcode step before finish() ever runs, so
+// MediaRecorder's onstop has ordinarily long since fired by the time
+// finish() awaits this.
+function stopTiltGestureRecording() {
+  const rec = tiltGestureRecorder;
+  tiltGestureRecorder = null;
+  if (!rec) {
+    if (tiltGestureVideoReadyResolve) tiltGestureVideoReadyResolve();
+    return;
+  }
+  const mimeType = rec.mimeType || 'video/webm';
+  rec.onstop = () => {
+    if (tiltGestureChunks.length) {
+      tiltGestureVideo = new Blob(tiltGestureChunks, { type: mimeType });
+    }
+    tiltGestureChunks = [];
+    if (tiltGestureVideoReadyResolve) tiltGestureVideoReadyResolve();
+  };
+  try {
+    if (rec.state !== 'inactive') rec.stop();
+    else if (tiltGestureVideoReadyResolve) tiltGestureVideoReadyResolve();
+  } catch (e) {
+    console.warn('tilt gesture video stop failed:', e.message);
+    if (tiltGestureVideoReadyResolve) tiltGestureVideoReadyResolve();
+  }
+}
+
+function beginTiltStep(){
+  startTiltGestureRecording();
+  state.side='tilt';
+  state.tiltShots=[]; state.lastTiltShot=0;
+  state.tiltSamples=[];
+  state.lastTiltSig=null;
+  state.tiltStart=performance.now();
+  state.lastTiltSample=0;
+  els.promptSide.textContent='SECURITY CHECK';
+  els.promptMain.textContent='Rock the card until the sheen sweeps across it';
+  if(els.tiltDemo) els.tiltDemo.classList.add('show');
+  els.chips.innerHTML='';
+}
+function tiltCoverage(){
+  const n=state.tiltSamples.length;
+  const elapsed=performance.now()-(state.tiltStart||performance.now());
+  if(!n) return {n:0, frac:0, meanDelta:0, elapsed};
+  const ds=state.tiltSamples.map(s=>s.delta).filter(v=>v!=null);
+  const meanDelta = ds.length? ds.reduce((a,b)=>a+b,0)/ds.length : 0;
+  const frac=Math.min(1, ( Math.min(1,n/TILT.minSamples)
+                         + Math.min(1,elapsed/TILT.minDurationMs)
+                         + Math.min(1,meanDelta/TILT.minMeanDelta) ) / 3);
+  return {n, frac, meanDelta, elapsed};
+}
+function tiltStepTick(ts){
+  if(ts-state.lastProcess < CONFIG.processEveryMs) return;
+  state.lastProcess=ts;
+  const res=evaluateFrame();
+  if(!res){ return; }
+  drawWire(res.det && !res.det.lowContrast ? res.det : null, false);
+  if(!res.metrics.detected){ els.guidance.textContent='Hold the front of your ID in view'; els.guidance.classList.remove('ok'); return; }
+  // Sample on a cadence while the card is in view and reasonably sharp.
+  if(res.tiltSample && res.metrics.sharp >= CONFIG.gates.sharpnessMin*0.6 && ts-state.lastTiltSample>=TILT.sampleEveryMs){
+    state.lastTiltSample=ts;
+    state.tiltSamples.push(res.tiltSample);
+    if(ts-(state.lastTiltShot||0) >= 1100){
+      state.lastTiltShot=ts;
+      const img=grabTiltFrame();
+      if(img) state.tiltShots.push({ aspect:res.tiltSample.aspect, img });
+    }
+  }
+  const cov=tiltCoverage();
+  const elapsed=ts-state.tiltStart;
+  els.guidance.classList.toggle('ok', cov.frac>=1);
+  els.guidance.textContent = cov.frac>=1 ? 'Got it' :
+    (cov.meanDelta < TILT.minMeanDelta*0.6 ? 'Tilt until the sheen moves across the card'
+                                           : 'Keep tilting slowly');
+  // Complete on coverage, or accept what we have after the cap — insufficient
+  // coverage is itself recorded, never a trap for the user.
+  if((cov.n>=TILT.minSamples && cov.elapsed>=TILT.minDurationMs && cov.meanDelta>=TILT.minMeanDelta) || elapsed>TILT.maxMs){
+    stopTiltGestureRecording(); // v68.15: clip ends exactly when the gesture is confirmed done (or the cap is hit)
+    state.tiltSummary = tiltSummary(state.tiltSamples);
+    state.captured.tiltFrames = selectTiltFrames(state.tiltShots);
+    if(state.tiltSummary) state.tiltSummary.retainedFrames = state.captured.tiltFrames.length;
+    if(state.tiltSummary){
+      state.tiltSummary.coverageAchieved = (cov.n>=TILT.minSamples && cov.elapsed>=TILT.minDurationMs && cov.meanDelta>=TILT.minMeanDelta);
+      state.tiltSummary.durationMs = Math.round(cov.elapsed);
+    }
+    fireFlash();
+    beginSide('back');
+  }
+}
+function drawTiltProgress(ctx,c){
+  const cov=tiltCoverage();
+  const w=c.width*0.62, h=Math.max(6,c.height*0.012);
+  const x=(c.width-w)/2, y=c.height-h-Math.max(18,c.height*0.06);
+  const css=getComputedStyle(document.documentElement);
+  ctx.fillStyle='rgba(10,13,20,0.6)'; ctx.fillRect(x,y,w,h);
+  ctx.fillStyle=cov.frac>=1? css.getPropertyValue('--green').trim() : css.getPropertyValue('--accent').trim();
+  ctx.fillRect(x,y,w*cov.frac,h);
+  ctx.fillStyle='rgba(232,240,248,0.85)'; ctx.textAlign='center'; ctx.textBaseline='bottom';
+  ctx.font=`700 ${Math.max(10,c.width*0.016)}px 'JetBrains Mono',monospace`;
+  ctx.fillText('ANGLE COVERAGE '+Math.round(cov.frac*100)+'%', c.width/2, y-4);
+}
+// ── Barcode step (dedicated tight capture + stronger decoder) ───────────
+const bpCanvas=document.createElement('canvas');
+const bpCtx=bpCanvas.getContext('2d',{willReadFrequently:true});
+function barcodePresenceFullRes(det, w, h){
+  try{
+    const vw=els.video.videoWidth, vh=els.video.videoHeight;
+    if(!vw) return 0;
+    const s=vw/w;
+    const x0=Math.max(0,Math.round(det.x0*s)), x1=Math.min(vw,Math.round(det.x1*s));
+    const y0=Math.max(0,Math.round(det.y0*s)), y1=Math.min(vh,Math.round(det.y1*s));
+    const cw=x1-x0, ch=y1-y0;
+    if(cw<16||ch<8) return 0;
+    bpCanvas.width=cw; bpCanvas.height=ch;
+    bpCtx.drawImage(els.video, x0,y0,cw,ch, 0,0,cw,ch);
+    const g=toGray(bpCtx.getImageData(0,0,cw,ch).data,cw,ch);
+    const region={x0:0,y0:0,x1:cw,y1:ch};
+    // Geometry MUST be measured here, at full resolution. On the 480px analysis
+    // frame the bars smear together and it found nothing at all (regionAspect
+    // null, widthFrac 0) on a card that plainly had a barcode.
+    state.lastBarcodeGeom = barcodeRegionGeometry(g,cw,ch,region);
+    // v67 diagnostic addition: the existing `sharp` metric is measured on the
+    // DOWNSCALED 480px analysis frame, which (per this function's own comment
+    // above) is already known to be structurally incapable of resolving PDF417
+    // bar detail once the card is smaller than full native width -- a frame can
+    // read as perfectly sharp there while still being too blurred, at the ACTUAL
+    // full-resolution crop used here, for the bars to produce edge transitions.
+    // Measuring Laplacian variance on this same full-res crop (not the analysis
+    // frame) is what lets a future diagnostics dump actually distinguish "the
+    // barcode region is genuinely blurred at full resolution" from "presence
+    // detection has some other bug" instead of guessing between them.
+    state.lastBarcodeCropSharp = +laplacianVariance(g,cw,ch).toFixed(0);
+    return barcodePresenceScore(g,cw,ch,region);
+  }catch(e){ return 0; }
+}
+function beginBarcodeStep(){
+  state.side='barcode';
+  state.barcodeResult=null; state.barcodeAttempts=0; state.decodeInFlight=false;
+  // v68.15.3: clear any barcode geometry from a previous run of this step
+  // (standalone test mode can re-enter it) so a stale anchor never survives
+  // into a session where the barcode goes unread this time.
+  state.barcodeBottomFrac=null; state.barcodeCropOrigin=null;
+  state.barcodeStepStart=performance.now();
+  els.promptSide.textContent='BACK \u2014 BARCODE';
+  els.promptMain.textContent='Fill the guide with the barcode';
+  els.chips.innerHTML='';
+  applySupportedCaptureControls();
+  initDecoders();
+}
+async function initDecoders(){
+  if(!state.barcodeReader) initBarcodeReader();      // JS fallback, ready now
+  state.barcodeEngine='zxing-js';
+  try{
+    const mod=await import('https://esm.sh/zxing-wasm@1.3.4/reader');
+    const rb = (typeof mod.readBarcodes==='function' && mod.readBarcodes)
+            || (mod.default && typeof mod.default.readBarcodes==='function' && mod.default.readBarcodes);
+    if(rb){
+      state.wasmRead = async (canvas)=>{
+        const blob = await new Promise(r=>canvas.toBlob(r,'image/png'));   // Blob = most robust input
+        // v68.15.2: Code39, not PDF417 -- see initBarcodeReader()'s comment.
+        return await rb(blob, {formats:['Code39'], tryHarder:true, maxNumberOfSymbols:1});
+      };
+      state.barcodeEngine='zxing-wasm';               // stronger decoder online
+    } else { state.wasmRead=null; state.barcodeLastErr='wasm:no-export'; }
+  }catch(e){ state.wasmRead=null; console.warn('zxing-wasm load failed; JS fallback:', e&&e.message); }
+}
+function fullFrameCanvas(){
+  const vw=els.video.videoWidth, vh=els.video.videoHeight;
+  const c=document.createElement('canvas'); c.width=vw; c.height=vh;
+  c.getContext('2d').drawImage(els.video,0,0,vw,vh);
+  state.barcodeCrop=vw+'x'+vh+'(full)';
+  // v68.15.3: this attempt's decodeSource origin, in full-video coordinates --
+  // see cropGuideRegion()'s matching line and the MRZ-anchoring comment above
+  // cropMrzGuideRegion() for why this is recorded.
+  state.barcodeCropOrigin={x:0,y:0};
+  return c;
+}
+function cropGuideRegion(){
+  const vw=els.video.videoWidth, vh=els.video.videoHeight;
+  const g=BARCODE_GUIDE;
+  // Same card-relative anchoring as paintBarcodeGuide() above — this is the
+  // ACTUAL decode crop, so if it drifted out of sync with the on-screen box
+  // (as it would on any aspect ratio other than what this was tuned against)
+  // the visible guide would lie about what's being read.
+  const card=cardRect({width:vw,height:vh});
+  const bx0=card.x0+g.fx0*card.gw, by0=card.y0+g.fy0*card.gh;
+  const bx1=card.x0+g.fx1*card.gw, by1=card.y0+g.fy1*card.gh;
+  // Decode a region PADDED beyond the visible guide, so a barcode that sits a
+  // little above/below the box still keeps all its PDF417 rows (a clipped
+  // barcode won't decode). The tight box is just the aiming target.
+  // The guide is an AIMING AID; the decode region is deliberately larger,
+  // so overfilling the guide (which users naturally do) still leaves the full
+  // symbol plus its quiet zones inside the decoded image.
+  // padX was 0.30 when the guide box was still narrow (74% of card width).
+  // After widening the box to 86% of card width, the box's own margin to the
+  // frame edge shrank to where 0.30 routinely exceeded it — the crop then
+  // clamped to the full frame width on both sides, giving ZERO effective
+  // horizontal zoom (confirmed on a real device: reported decode dimensions
+  // matched a full-width crop exactly). Shrunk to 0.10, then further to 0.05.
+  // padY had the same problem in a different way: at 1.20x (added on BOTH
+  // top and bottom), the padded region's own height came out to ~116% of the
+  // entire assumed card height — i.e. bigger than the whole card, before it
+  // even hit the frame edges. That's not a "closeup" by any definition; it's
+  // why a real device capture came back reporting 958x676 / 1080x1920 (full-
+  // frame-sized) images that were indistinguishable from the plain back-of-
+  // card photo. Shrunk to 0.35 — total height lands around 58% of assumed
+  // card height, real slack for a misaligned barcode without erasing the zoom.
+  const padY=(by1-by0)*0.35, padX=(bx1-bx0)*0.05;
+  const cx0=Math.max(0,Math.round(bx0-padX)), cy0=Math.max(0,Math.round(by0-padY));
+  const cx1=Math.min(vw,Math.round(bx1+padX)), cy1=Math.min(vh,Math.round(by1+padY));
+  const cw=cx1-cx0, ch=cy1-cy0;
+  const c=document.createElement('canvas'); c.width=cw; c.height=ch;
+  c.getContext('2d').drawImage(els.video, cx0,cy0,cw,ch, 0,0,cw,ch);
+  state.barcodeCrop=cw+'x'+ch;
+  // v68.15.3: record this attempt's crop origin in full-video coordinates --
+  // decodeCanvas()'s reported corner points are local to THIS canvas, so
+  // anything downstream that wants them in video space (cropMrzGuideRegion's
+  // barcode anchor) needs to add this back.
+  state.barcodeCropOrigin={x:cx0,y:cy0};
+  return c;
+}
+// Returns {text, points} on success (points = the decoder's own reported
+// corner geometry, in the SAME pixel space as `canvas`, or null if the
+// engine didn't report any) — or null on no-decode. Callers use `points` to
+// crop the EXACT region the decoder just proved readable, rather than
+// independently re-guessing a "closeup" region (see cropAroundPoints()).
+async function decodeCanvas(canvas){
+  const ctx=canvas.getContext('2d');
+  if(state.wasmRead){                                 // WASM (zxing-cpp) path
+    try{
+      const res=await state.wasmRead(canvas);
+      if(res&&res.length&&res[0].text){
+        const p=res[0].position;
+        const points = p ? [p.topLeft,p.topRight,p.bottomRight,p.bottomLeft].filter(Boolean) : null;
+        return { text: res[0].text, points };
+      }
+      state.barcodeLastErr='wasm:no-symbol';
+    }catch(e){ state.barcodeLastErr='wasm:'+(e&&(e.name||e.message)); }
+  }
+  if(state.barcodeReader && window.ZXing){             // JS fallback path
+    const ZX=window.ZXing;
+    for(const mk of [()=>new ZX.HybridBinarizer(new ZX.HTMLCanvasElementLuminanceSource(canvas)),
+                     ()=>new ZX.GlobalHistogramBinarizer(new ZX.HTMLCanvasElementLuminanceSource(canvas))]){
+      try{
+        const r=state.barcodeReader.decode(new ZX.BinaryBitmap(mk()));
+        if(r&&r.getText()){
+          let points=null;
+          try{
+            const rp=r.getResultPoints && r.getResultPoints();
+            if(rp && rp.length) points=rp.map(pt=>({x:pt.getX(),y:pt.getY()}));
+          }catch(_){}
+          return { text: r.getText(), points };
+        }
+      }
+      catch(e){ state.barcodeLastErr='js:'+(e&&(e.name||'NotFound')); }
+      finally{ try{ state.barcodeReader.reset(); }catch(_){} }
+    }
+  }
+  return null;
+}
+// Crop directly out of the CANVAS THAT JUST DECODED, anchored to the
+// decoder's own corner points, with generous padding for quiet zones.
+// WHY THIS EXISTS (root-caused from a real device failure where client-side
+// decode kept succeeding — the step visibly completed — but the server's
+// independent re-decode of the saved image kept failing): the image sent to
+// the backend was never guaranteed to be the SAME PIXELS the client just
+// proved were decodable. It was a SEPARATE, independently-computed guess
+// (cropGuideRegion(), re-run fresh) about where the barcode probably was.
+// Most concretely: barcodeStepTick()'s every-4th-attempt full-frame safety
+// net exists SPECIFICALLY for barcodes sitting outside the guide box — so
+// when THAT attempt is what succeeds, a freshly recomputed cropGuideRegion()
+// may not even contain the barcode at all. Anchoring the saved crop to the
+// decoder's own reported geometry, taken from the exact canvas it just read,
+// removes that whole class of guesswork: what the server receives is always
+// provably the thing the client decoded, not a separate inference about it.
+function cropAroundPoints(canvas, points){
+  if(!points || !points.length) return null;
+  let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+  for(const p of points){
+    if(!p || typeof p.x!=='number' || typeof p.y!=='number') continue;
+    if(p.x<minX)minX=p.x; if(p.x>maxX)maxX=p.x;
+    if(p.y<minY)minY=p.y; if(p.y>maxY)maxY=p.y;
+  }
+  if(!isFinite(minX)||!isFinite(minY)||!isFinite(maxX)||!isFinite(maxY)) return null;
+  const bw=maxX-minX, bh=maxY-minY;
+  if(bw<=0||bh<=0) return null;
+  // PDF417 corner points bound the SYMBOL, not its quiet zone — pad generously,
+  // more on Y than X (real PDF417s report a snug width but the quiet-zone/row
+  // margin above and below matters more for re-decode reliability).
+  const padX=Math.max(bw*0.15, 12), padY=Math.max(bh*0.6, 12);
+  const cx0=Math.max(0,Math.round(minX-padX)), cy0=Math.max(0,Math.round(minY-padY));
+  const cx1=Math.min(canvas.width,Math.round(maxX+padX)), cy1=Math.min(canvas.height,Math.round(maxY+padY));
+  const cw=cx1-cx0, ch=cy1-cy0;
+  if(cw<=0||ch<=0) return null;
+  const c=document.createElement('canvas'); c.width=cw; c.height=ch;
+  c.getContext('2d').drawImage(canvas, cx0,cy0,cw,ch, 0,0,cw,ch);
+  return c;
+}
+function barcodeStepTick(ts){
+  const elapsed=ts-(state.barcodeStepStart||ts);
+  // Settle window: show the guide + a "get ready" prompt, but don't fire any
+  // decode attempts yet. Gives the hand time to finish moving the card into
+  // the box (right after the flip prompt) instead of capturing mid-motion.
+  if(elapsed < BARCODE_SETTLE_MS){
+    els.guidance.textContent='Get ready… hold the barcode in the box';
+    els.guidance.classList.remove('ok');
+    return;
+  }
+  els.guidance.textContent=barcodeLightingGuidance() || BARCODE_TIPS[Math.floor((elapsed-BARCODE_SETTLE_MS)/2500)%BARCODE_TIPS.length];
+  els.guidance.classList.remove('ok');
+  if(!state.barcodeResult && elapsed > BARCODE_MAX_MS && !state.decodeInFlight){
+    // v68.15.2: advance to the dedicated MRZ step rather than finishing --
+    // an unreadable barcode is reported (present_undecodable/timedOutMs in
+    // buildPayload()), not a submission blocker, same honest-proxy
+    // treatment MRZ itself now gets in mrzStepTick() below.
+    state.barcodeUnreadable=true; fireFlash(); beginMrzStep(); return;
+  }
+  if(state.decodeInFlight || ts-state.lastBarcode < 150) return;
+  state.lastBarcode=ts; state.decodeInFlight=true;
+  state.barcodeAttempts=(state.barcodeAttempts||0)+1;
+  // Safety net: every 4th attempt decodes the WHOLE frame, so a barcode held
+  // above or below the guide is still recoverable.
+  const useFullFrame = state.barcodeAttempts%4===3;
+  const decodeSource = useFullFrame ? fullFrameCanvas() : cropGuideRegion();
+  // The image we SAVE (for the reviewer panel + server decode) is always the
+  // tight guide crop — never the raw full frame, even on an attempt where
+  // the full-frame safety net is what we're decoding from. Without this
+  // split, a safety-net success saved the FULL 1080x1920 frame as the
+  // "Barcode Closeup" (confirmed on a real device: 2.8MB image, exact video
+  // dimensions, mislabeled as a closeup) — and that full-frame image then
+  // failed the server's own decode attempt even though the client had just
+  // decoded it, because the barcode occupies too small a fraction of a full
+  // frame for the server-side decoder's default tuning to resolve reliably.
+  // Computing the guide crop is cheap, so we always do it regardless of
+  // which canvas we're actually decoding from this attempt.
+  const closeupCrop = useFullFrame ? cropGuideRegion() : decodeSource;
+  adaptBarcodeLighting(closeupCrop);
+  // Always keep the latest crop, so an UNREADABLE barcode still reaches the
+  // reviewer as an image and not merely as a flag.
+  // PNG, not JPEG — this bit the app once already (see the back-image resize/
+  // recompress history above): decodeCanvas()'s own WASM path decodes a
+  // LOSSLESS PNG blob of this exact canvas, so a crop that decodes cleanly
+  // client-side could still come back "0 symbols found" server-side if what
+  // actually got sent was a fresh lossy JPEG re-encode of the same pixels.
+  // This crop is already small (a closeup, not a full-resolution photo), so
+  // PNG's size cost here is negligible next to the risk of silently
+  // re-introducing a bug this project already spent real effort fixing once.
+  state.captured.backBarcode=closeupCrop.toDataURL('image/png');
+  computeBarcodeVisualMatch(closeupCrop);
+  decodeCanvas(decodeSource).then(res=>{
+    if(res && res.text){
+      state.barcodeResult=res.text;
+      // v68.15.3: also record where the barcode's OWN bottom edge actually
+      // sits on THIS card, as a fraction of cardRect()'s height -- a fraction
+      // rather than an absolute pixel value because this gets reused by both
+      // cropMrzGuideRegion() (video-native pixel space) and paintMrzGuide()
+      // (overlay-canvas pixel space); cardRect()'s proportions are the same
+      // in both since layoutOverlay() keeps the overlay's aspect ratio
+      // matched to the video feed. Root-caused from two real-device reports
+      // where the MRZ closeup came back showing mostly barcode content --
+      // "it seemed to prefer the barcode." MRZ_GUIDE's static fy0=0.72 was a
+      // reasonable ICAO-9303 estimate, but real cards vary in exactly how
+      // they're framed against cardRect()'s idealized box, and the two
+      // guides' own padded regions turned out to overlap. A barcode we just
+      // proved we can see beats a guessed fraction -- see
+      // cropMrzGuideRegion()'s comment for how this is used.
+      if(res.points && res.points.length){
+        let maxY=-Infinity;
+        for(const p of res.points){ if(p && typeof p.y==='number' && p.y>maxY) maxY=p.y; }
+        if(isFinite(maxY)){
+          const origin=state.barcodeCropOrigin||{x:0,y:0};
+          const vw=els.video.videoWidth, vh=els.video.videoHeight;
+          const cardV=cardRect({width:vw,height:vh});
+          state.barcodeBottomFrac=(origin.y+maxY-cardV.y0)/cardV.gh;
+        }
+      }
+      // Prefer a crop anchored to the decoder's OWN result geometry, cut from
+      // the exact canvas that just decoded — see cropAroundPoints()'s comment.
+      //
+      // REAL FAILURE CONFIRMED (v67, real device): captureSignals.barcode
+      // reported decoded:true (client-side decode genuinely succeeded), yet
+      // the server's own independent decode of the saved backBarcodeImage
+      // came back "0 PDF417 symbols found." That is EXACTLY the failure mode
+      // cropAroundPoints()'s anchoring fix exists to prevent — and it still
+      // happened, because the previous fallback here was closeupCrop: an
+      // INDEPENDENTLY GUESSED region, not provably the pixels that decoded.
+      // That fallback fires whenever the engine succeeds without reporting
+      // corner points (zxing-wasm usually does; the zxing.js fallback path's
+      // getResultPoints() can legitimately return nothing for some symbols),
+      // which silently reintroduces the exact bug this whole function was
+      // written to root-cause.
+      // Fall back to decodeSource itself instead — the literal canvas
+      // decodeCanvas() was just handed and returned a successful result
+      // against. Less tightly cropped than a real `verified` result (and on
+      // the rare attempt where decodeSource is the full-frame safety-net
+      // canvas rather than the guide crop, noticeably bigger), but pixel-for-
+      // pixel guaranteed to be what the client actually decoded — which is
+      // the property that matters here, not tightness.
+      const verified = res.points && cropAroundPoints(decodeSource, res.points);
+      const finalCrop = verified || decodeSource;
+      state.captured.backBarcode = finalCrop.toDataURL('image/png');
+      // Diagnostic only (see captureSignals.barcode.savedCropSource below) —
+      // so a future "client decoded, server couldn't" report is instantly
+      // diagnosable from the Raw Response panel alone, instead of requiring
+      // another round of code archaeology like this one did.
+      state.lastBarcodeSaveSource = verified ? 'verified' : 'decodeSource-fallback';
+      // Recompute against the FINAL crop actually being saved/sent, not the
+      // provisional one from earlier in this same attempt.
+      computeBarcodeVisualMatch(finalCrop);
+      // v68.15.2: advance to the dedicated MRZ step instead of finishing --
+      // see SECTION 7.5's file comment for why MRZ now comes AFTER barcode.
+      beginMrzStep();
+    }
+  }).catch(e=>{ state.barcodeLastErr='ex:'+(e&&(e.name||e.message)); })
+    .finally(()=>{ state.decodeInFlight=false; });
+}
+function paintBarcodeGuide(){
+  const c=els.overlay, ctx=c.getContext('2d');
+  ctx.clearRect(0,0,c.width,c.height);
+  const g=BARCODE_GUIDE;
+  // BARCODE_GUIDE's fractions were tuned against where the barcode sits ON
+  // THE CARD (roughly centered, lower-middle — matches real PDF417 placement
+  // on a driver's license back), not against the raw video frame. Anchor to
+  // cardRect() rather than c.width/c.height directly, so this still lines up
+  // once the card is actually framed at whatever aspect ratio this camera
+  // happens to produce (a laptop webcam's is typically very different from
+  // the phone aspect ratio this was tuned/tested against).
+  const card=cardRect(c);
+  const x0=card.x0+g.fx0*card.gw, y0=card.y0+g.fy0*card.gh,
+        x1=card.x0+g.fx1*card.gw, y1=card.y0+g.fy1*card.gh, w=x1-x0, h=y1-y0;
+  ctx.fillStyle='rgba(10,13,20,0.5)';
+  ctx.fillRect(0,0,c.width,y0); ctx.fillRect(0,y1,c.width,c.height-y1);
+  ctx.fillRect(0,y0,x0,h); ctx.fillRect(x1,y0,c.width-x1,h);
+  const css=getComputedStyle(document.documentElement);
+  const amber=css.getPropertyValue('--accent').trim(), green=css.getPropertyValue('--green').trim();
+  const done=!!state.barcodeResult;
+  ctx.save(); ctx.beginPath(); ctx.rect(x0,y0,w,h); ctx.clip();
+  ctx.globalAlpha=0.26; ctx.fillStyle='#C8D6E8';
+  let bx=x0+w*0.04, seed=1;
+  while(bx < x0+w*0.96){
+    seed=(seed*1103515245+12345)&0x7fffffff;
+    const bar=w*(0.004+(seed%5)*0.0028), gap=w*(0.004+((seed>>4)%5)*0.0028);
+    ctx.fillRect(bx, y0+h*0.18, bar, h*0.64); bx+=bar+gap;
+  }
+  ctx.restore();
+  ctx.strokeStyle=done?green:amber; ctx.lineWidth=Math.max(3,c.width*0.008);
+  ctx.setLineDash(done?[]:[14,10]); ctx.strokeRect(x0,y0,w,h); ctx.setLineDash([]);
+  ctx.fillStyle='rgba(232,240,248,0.9)'; ctx.textAlign='center'; ctx.textBaseline='top';
+  ctx.font=`700 ${Math.max(11,c.width*0.018)}px 'JetBrains Mono',monospace`;
+  ctx.fillText('ALIGN THE BARCODE', (x0+x1)/2, y1+10);
+}
+
+/* ── MRZ closeup step (v68.15.2) — mirrors the barcode step immediately
+   above: own settle window, throttled repeated attempts, bounded timeout,
+   own on-screen guide. See SECTION 7.5's file comment for why this
+   replaced the old back-step side channel, and why it's sequenced AFTER
+   the barcode step rather than between back and barcode. ── */
+function beginMrzStep(){
+  state.side='mrz';
+  mrzResult=null; mrzOcrAttempts=0; mrzOcrInFlight=false;
+  state.mrzStepStart=performance.now();
+  els.promptSide.textContent='BACK — MRZ';
+  // v68.15.3: "the guide" is the SAME static card position as the barcode
+  // step, just a different band of it -- the card itself shouldn't need to
+  // move. Two real-device testers read the box changing shape as a cue to
+  // physically reposition the card, which (combined with the crop-overlap
+  // bug fixed alongside this) fed straight into "it seemed to prefer the
+  // barcode." Saying so explicitly costs nothing and removes that instinct.
+  els.promptMain.textContent='Keep the card where it was -- now reading the bottom lines';
+  els.chips.innerHTML='';
+}
+function mrzStepTick(ts){
+  const elapsed=ts-(state.mrzStepStart||ts);
+  // Settle window: same purpose as BARCODE_SETTLE_MS -- give the hand time
+  // to reframe from the barcode box to this differently-shaped one before
+  // burning OCR attempts on a mid-motion frame.
+  if(elapsed < MRZ_SETTLE_MS){
+    els.guidance.textContent='Get ready… don’t move the card, just hold steady';
+    els.guidance.classList.remove('ok');
+    return;
+  }
+  els.guidance.textContent = mrzResult ? 'MRZ read' : MRZ_TIPS[Math.floor((elapsed-MRZ_SETTLE_MS)/2500)%MRZ_TIPS.length];
+  els.guidance.classList.toggle('ok', !!mrzResult);
+  if(!mrzResult && elapsed > MRZ_MAX_MS && !mrzOcrInFlight){
+    // Honest-proxy timeout, same treatment as the barcode step's own
+    // BARCODE_MAX_MS branch: an unreadable MRZ is reported, not a
+    // submission blocker. Save whatever the last framed crop looked like
+    // (even though it never parsed) so a reviewer still has an image to
+    // look at, same "always keep something for review" precedent as
+    // state.captured.backBarcode.
+    const c = cropMrzGuideRegion();
+    if(c) state.captured.backMrz = c.toDataURL('image/jpeg',0.9);
+    fireFlash(); finish(); return;
+  }
+  if(mrzOcrInFlight || !tesseractWorker || ts-(state.lastMrzOcrAt||0) < MRZ_OCR_INTERVAL_MS) return;
+  state.lastMrzOcrAt=ts;
+  const region=cropMrzGuideRegion();
+  if(!region) return; // video not ready yet -- try again next tick, no attempt burned
+  mrzOcrInFlight=true;
+  mrzOcrAttempts++;
+  // Keep the latest crop regardless of outcome -- mirrors
+  // state.captured.backBarcode's "always have something to show" rule.
+  state.captured.backMrz = region.toDataURL('image/jpeg',0.9);
+  attemptMrzOcr(region).then(parsed=>{
+    mrzOcrInFlight=false;
+    if(parsed){
+      mrzResult=parsed;
+      fireFlash();
+      finish();
+    }
+  }).catch(e=>{
+    mrzOcrInFlight=false;
+    console.warn('mrz_ocr_error:', e && e.message);
+  });
+}
+function paintMrzGuide(){
+  const c=els.overlay, ctx=c.getContext('2d');
+  ctx.clearRect(0,0,c.width,c.height);
+  const g=MRZ_GUIDE;
+  const card=cardRect(c);
+  // v68.15.3: fy0 comes from effectiveMrzFy0(), not g.fy0 directly, so the
+  // box the user actually sees always matches where cropMrzGuideRegion() is
+  // really reading from -- see that function's comment.
+  const x0=card.x0+g.fx0*card.gw, y0=card.y0+effectiveMrzFy0()*card.gh,
+        x1=card.x0+g.fx1*card.gw, y1=card.y0+g.fy1*card.gh, w=x1-x0, h=y1-y0;
+  ctx.fillStyle='rgba(10,13,20,0.5)';
+  ctx.fillRect(0,0,c.width,y0); ctx.fillRect(0,y1,c.width,c.height-y1);
+  ctx.fillRect(0,y0,x0,h); ctx.fillRect(x1,y0,c.width-x1,h);
+  const css=getComputedStyle(document.documentElement);
+  const amber=css.getPropertyValue('--accent').trim(), green=css.getPropertyValue('--green').trim();
+  const done=!!mrzResult;
+  // Three faint horizontal rules suggest the 3 MRZ text lines -- deliberately
+  // distinct from the barcode guide's vertical-bar pattern just above, so a
+  // user coming straight from that step immediately reads this as a
+  // different kind of target rather than "the same box again."
+  ctx.save(); ctx.beginPath(); ctx.rect(x0,y0,w,h); ctx.clip();
+  ctx.strokeStyle='rgba(200,214,232,0.35)'; ctx.lineWidth=Math.max(1,c.width*0.0015);
+  for(let i=1;i<=3;i++){
+    const ly=y0+h*(i/3.6);
+    ctx.beginPath(); ctx.moveTo(x0+w*0.04, ly); ctx.lineTo(x1-w*0.04, ly); ctx.stroke();
+  }
+  ctx.restore();
+  ctx.strokeStyle=done?green:amber; ctx.lineWidth=Math.max(3,c.width*0.008);
+  ctx.setLineDash(done?[]:[14,10]); ctx.strokeRect(x0,y0,w,h); ctx.setLineDash([]);
+  ctx.fillStyle='rgba(232,240,248,0.9)'; ctx.textAlign='center'; ctx.textBaseline='top';
+  ctx.font=`700 ${Math.max(11,c.width*0.018)}px 'JetBrains Mono',monospace`;
+  ctx.fillText('ALIGN THE MRZ LINES', (x0+x1)/2, y1+10);
+}
+async function finish(){
+  stopCamera();
+  els.shotFront.src = state.captured.front;
+  els.shotBack.src = state.captured.back;
+  if(state.captured.backBarcode){ els.shotBarcode.src = state.captured.backBarcode; els.shotBarcodeWrap.style.display=''; }
+  else if(els.shotBarcodeWrap){ els.shotBarcodeWrap.style.display='none'; }
+  const payload = buildPayload();
+  els.payloadJson.textContent = JSON.stringify(payload, null, 2);
+  showScreen(els.screenResult);
+
+  // v68.15: wait for the tilt gesture video's Blob to finish finalizing
+  // (MediaRecorder.stop()'s onstop fires asynchronously) before building the
+  // postMessage payload below -- same bounded-wait pattern as the passport
+  // flow's finalizeCapture(). In practice this resolves near-instantly here:
+  // stopTiltGestureRecording() already ran back in tiltStepTick(), and the
+  // back-of-card + barcode steps that ran since give onstop plenty of time
+  // to fire well before finish() is ever reached.
+  if (tiltGestureVideoReadyPromise) {
+    await Promise.race([tiltGestureVideoReadyPromise, new Promise(resolve => setTimeout(resolve, 2000))]);
+  }
+
+  // ── SLOT-IN HOOK (active) ──────────────────────────────────────────────
+  // safe_intake_v6.html embeds this page in an iframe (its Live Capture
+  // toggle) and owns the actual handoff construction — applicant fields,
+  // IndexedDB write, and the sessionStorage payload safe_capture_13.html
+  // reads. This page's only job when embedded is to report what it captured
+  // back to that parent via postMessage, so the same component works
+  // whether it's iframed, opened in a new tab, or run standalone for direct
+  // testing (in which case there's no parent listening and this is a no-op).
+  if (window.parent && window.parent !== window) {
+    try {
+      window.parent.postMessage({
+        type: 'safeAutocaptureComplete',
+        // backBarcodeImage: the zoomed-in decode crop from the barcode step
+        // (state.captured.backBarcode), not just the wide back-of-card shot.
+        // This was previously dropped here entirely — the backend's own
+        // barcode decode only ever saw the full back image, which is exactly
+        // the "not zoomed in enough" case this whole barcode sub-step exists
+        // to avoid. Server-side decode should prefer this and fall back to
+        // backImage only if it's absent — see live_analysis.py.
+        // v68.15: tiltFrameImages (3 stills, already computed by the tilt
+        // step but previously dropped here entirely -- see
+        // state.captured.tiltFrames's file comment) and tiltGestureVideo
+        // (a Blob, same transport precedent as the passport opening-gesture
+        // video) ride along as additional evidence for the tilt/OVI check.
+        images: { frontImage: state.captured.front, backImage: state.captured.back,
+                  backBarcodeImage: state.captured.backBarcode || null,
+                  // v68.15.2: the dedicated MRZ step's own closeup crop --
+                  // same "always send something for review, even on an
+                  // unreadable attempt" precedent as backBarcodeImage.
+                  backMrzImage: state.captured.backMrz || null,
+                  tiltFrameImages: state.captured.tiltFrames || [],
+                  tiltGestureVideo: tiltGestureVideo || null },
+        captureSignals: payload,
+        // v68.15.2: sibling of images/captureSignals, same shape/placement as
+        // the booklet file's own `mrz: mrzParsed` -- safe_idv_launch_*.html's
+        // handoff.mrz plumbing (already fully generic) picks this up with
+        // zero launch-file changes needed. {format:null} when OCR never
+        // produced a valid read (see SECTION 7.5) -- an honest "not read",
+        // not a missing key, so the report's MRZ Read card renders its
+        // proper red "Not parsed" state rather than a blank one.
+        mrz: mrzResult || {format:null},
+      }, '*'); // demo: same-origin in practice; production should pass the real parent origin instead of '*'
+    } catch (e) {
+      console.warn('safeAutocaptureComplete postMessage failed:', e.message);
+    }
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 9 — WIRING
+   ════════════════════════════════════════════════════════════════════════ */
+els.btnStart.addEventListener('click', startCamera);
+els.btnRestart.addEventListener('click', ()=>{
+  state.captured={front:null,back:null}; state.silent={front:null,back:null};
+  state.barcodeResult=null;
+  state.barcodeCropVisualMatch=null;
+  showScreen(els.screenIntro);
+});
+els.btnCopy.addEventListener('click', ()=>{
+  navigator.clipboard?.writeText(els.payloadJson.textContent);
+  els.btnCopy.textContent='Copied'; setTimeout(()=>els.btnCopy.textContent='Copy payload',1200);
+});
+els.debugToggle.addEventListener('click', ()=>{
+  const on = els.debug.classList.toggle('show');
+  els.debugToggle.classList.toggle('on', on);
+  // Opening Debug starts the rolling capture log automatically.
+  state.logging = on;
+  els.logBadge.classList.toggle('on', on);
+  if(on) els.logBadge.textContent = 'REC '+state.log.length;
+});
+
+// Build a paste-ready diagnostics report from the rolling log: run context,
+// per-gate pass-rates and metric ranges (the real story behind "touchy" and
+// "won't detect on fabric"), plus the most recent frames verbatim.
+function buildDiagnostics(){
+  const L = state.log;
+  if(!L.length) return 'No frames logged yet. Open Debug (starts logging), point at your ID for a few seconds, then Copy diagnostics.';
+  const dev = state.deviceSignal||{};
+  const setg = (dev.settings)||{};
+  const num = (arr)=>arr.filter(v=>typeof v==='number'&&!isNaN(v));
+  const stat = (key)=>{ const vs=num(L.map(r=>r.m[key])); if(!vs.length) return 'n/a';
+    const mn=Math.min(...vs), mx=Math.max(...vs), av=vs.reduce((a,b)=>a+b,0)/vs.length;
+    return `min ${mn.toFixed(2)} / avg ${av.toFixed(2)} / max ${mx.toFixed(2)}`; };
+  const gateKeys = Object.keys(L[L.length-1].g);
+  const passRate = (k)=>{ const have=L.filter(r=>k in r.g); if(!have.length) return 'n/a';
+    const p=have.filter(r=>r.g[k]).length; return `${Math.round(100*p/have.length)}% (${p}/${have.length})`; };
+  const detFrames = L.filter(r=>r.m.detected).length;
+  const lcFrames = L.filter(r=>r.m.lowContrast).length;
+  const passFrames = L.filter(r=>r.pass).length;
+
+  let out = [];
+  out.push('=== SAFE Autocapture diagnostics ===');
+  out.push(`build ${BUILD_VERSION} | side ${state.log[state.log.length-1].side} | frames ${L.length} | span ${(L[L.length-1].t-L[0].t)}ms`);
+  out.push(`camera: ${setg.width||'?'}x${setg.height||'?'} facing=${setg.facingMode||'?'} fps=${setg.frameRate||'?'}`);
+  out.push(`virtualCam=${dev.virtualCameraSuspected?dev.matchedName:'none'}`);
+  out.push(`frames detected=${detFrames} lowContrast=${lcFrames} fullPass=${passFrames}`);
+  out.push('');
+  out.push('-- gate pass-rates --');
+  for(const k of gateKeys) out.push(`  ${k}: ${passRate(k)}`);
+  out.push('');
+  out.push('-- metric ranges (min/avg/max) --');
+  for(const key of ['separation','widthFrac','aspect','marginMin','skew','sharp','meanLuma','blownFrac','darkFrac','contrast','cast','obstruction','obsTexture','barcodePresence','barcodeCropSharp']){
+    out.push(`  ${key}: ${stat(key)}`);
+  }
+  out.push('');
+  out.push('-- last 12 frames (t, detected, sep, wF, aspect, sharp, skew, obstruction, PASS) --');
+  for(const r of L.slice(-12)){
+    const m=r.m;
+    out.push(`  ${r.t} det=${m.detected?1:(m.lowContrast?'lc':0)} sep=${m.separation??'-'} wF=${m.widthFrac} asp=${m.aspect} shp=${m.sharp} skw=${m.skew} obs=${m.obstruction} ${r.pass?'PASS':''}`);
+  }
+  out.push('');
+  if(state.log[state.log.length-1].side==='back' || state.barcodeAttempts){
+    out.push('-- barcode --');
+    out.push(`  engine=${state.barcodeEngine||'-'} attempts=${state.barcodeAttempts||0} decoded=${!!state.barcodeResult} lastCrop=${state.barcodeCrop||'-'} lastErr=${state.barcodeLastErr||'-'}`);
+    // Informational only -- no gate reads this yet. Compare against `sharp`
+    // in the metric ranges above: `sharp` is measured on the 480px analysis
+    // frame (backSharpnessMin:45 gates on it) and can read as fine while this
+    // number, measured on the SAME full-resolution crop barcodePresence
+    // itself scores, is genuinely low -- that split is what distinguishes
+    // "the frame really is too blurred at full resolution for PDF417 bars to
+    // register" from "presence detection has some other bug" when
+    // barcodePresent is failing but every other gate (including sharpness) passes.
+    out.push(`  barcodeCropSharp (full-res, informational): ${stat('barcodeCropSharp')}`);
+    out.push('');
+  }
+  out.push('-- thresholds --');
+  out.push('  '+JSON.stringify(CONFIG.gates));
+  return out.join('\n');
+}
+
+els.dbgCopy.addEventListener('click', async ()=>{
+  const text = buildDiagnostics();
+  let done=false;
+  try{ await navigator.clipboard.writeText(text); done=true; }catch(_){}
+  if(!done){
+    // clipboard API can be blocked; fall back to a selectable prompt
+    try{ window.prompt('Copy diagnostics (⌘/Ctrl+C):', text); done=true; }catch(_){}
+  }
+  els.dbgCopyStatus.textContent = done ? `copied ${state.log.length} frames` : 'copy failed — screenshot instead';
+  setTimeout(()=>{ els.dbgCopyStatus.textContent=''; }, 2500);
+});
+els.logBadge.addEventListener('click', ()=>{ state.log.length=0; els.logBadge.textContent='REC 0'; });
+
+window.addEventListener('resize', paintGuide);
+// Pre-populate camera list if permission already granted this origin.
+navigator.mediaDevices?.enumerateDevices && enumerateCameras();
+</script>
+</body>
+</html>

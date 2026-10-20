@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>SAFE Document Capture — Other</title>
+<!--
+  SAFE IDV — "Other ID Document" catch-all capture (v68.16)
+  ============================================================
+  WHY THIS IS A SEPARATE ARCHITECTURE, NOT A FOURTH VARIANT OF THE DL FILE
+  -------------------------------------------------------------------------
+  Every other capture file in this app (safe_idv_capture, the passport
+  booklet, the passport card) works by knowing the document's geometry in
+  advance: an ID-1 card at a known aspect ratio, a barcode/MRZ sitting at a
+  known fractional position on it, and a quality-gate loop that races
+  incoming frames against thresholds tuned for that specific shape until
+  one passes and auto-locks. None of that has anything to anchor to here.
+  "Other ID Document" is deliberately unbounded -- a tribal ID card, an
+  I-20, an EAD, a foreign national ID, whatever doesn't fit the standardized
+  tracks above. There's no known aspect ratio, no known barcode symbology
+  (or any barcode at all), no known security-feature layout, and for most
+  of these document types no central repository to verify structured field
+  data against even if we could decode something.
+
+  So this file abandons autocapture entirely. There is no guide box, no
+  quality gate, no auto-lock -- just a live camera view, a manual shutter
+  button, and a Retake/Continue confirmation after each shot. The person
+  holding the document decides when the shot is good, because we
+  structurally cannot: there is nothing to detect against.
+
+  WHAT STILL GETS COLLECTED, AND WHY IT'S HONEST
+  -------------------------------------------------------------------------
+  Two kinds of signal survive the loss of autocapture, and one kind does
+  NOT:
+   - Capture-integrity signals (distinct frame ratio, sharpness/luma
+     coefficient of variation, banding, moire) are FORMAT-AGNOSTIC -- they
+     ask "does this look like a live phone photo of a physical object or a
+     photo of a screen," which never required knowing what a legitimate
+     document looks like. These still run here, computed from a rolling
+     background sample buffer instead of an autocapture burst (see SECTION
+     4) so the same reviewer-facing signals exist for this doc type too.
+   - The front-shot -> flip -> back-shot sequence is recorded as ONE
+     continuous video from camera-start through the back shot being
+     accepted (see SECTION 5, mirrors the tilt-gesture/opening-gesture
+     video precedent elsewhere in this app) -- so a reviewer can see the
+     actual physical document turn over between the two stills, with no
+     edit point between them. This needs no document-specific gesture
+     detection to be useful: unlike the tilt step (which measures a
+     specific angle-response) this is just ambient evidence of physical
+     continuity.
+   - Deliberately NOT attempted: any barcode/MRZ decode (no known
+     symbology), and any vision-based "does this look authentic" judgment.
+     The latter was considered and rejected -- see the conversation this
+     file was built from. In short: a vision model's guess at document
+     legitimacy is only as good as its exposure to real examples of that
+     document type, and for something like a tribal ID card (574+ federally
+     recognized tribes, no standardized design, essentially no public
+     training corpus of authentic examples per tribe) that guess would be
+     unreliable in a specific, biased direction -- penalizing whatever
+     looks less like the small, uneven sample of designs a model happened
+     to see, which has nothing to do with whether a given card is real.
+     That bias would land squarely on the population this catch-all exists
+     to accommodate. So this file reports capture-integrity signals and
+     best-effort OCR-style transcription only, never a legitimacy score --
+     see buildPayload()'s `note` field, and safe_idv_report's rendering of
+     docType 'other', for how that's made explicit to a reviewer rather
+     than silently omitted.
+
+  DELIVERY MODEL
+  --------------
+  Same as every other capture file in this bundle: self-contained, iframed
+  by safe_idv_launch (reporting completion via postMessage
+  'safeAutocaptureComplete'), or opened directly for standalone testing (in
+  which case this file's own result screen is the only UI shown -- no
+  parent listening, no report handoff).
+-->
+<style>
+:root{
+  --bg:#0F1219; --surface:#1A2233; --surface2:#212D42;
+  --border:#2A3A52; --border-light:#374d6b;
+  --text:#C8D6E8; --text-dim:#7A90AA; --text-bright:#E8F0F8;
+  --accent:#E8A020; --accent-dim:rgba(232,160,32,0.15); --accent-border:rgba(232,160,32,0.4);
+  --cyan:#43B5C6;
+  --green:#3DB87A; --green-dim:rgba(61,184,122,0.12);
+  --red:#E85555; --red-dim:rgba(232,85,85,0.12);
+  --mono:'JetBrains Mono','Fira Code','Consolas',monospace;
+  --sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{height:100%;}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13.5px;
+  -webkit-font-smoothing:antialiased;overflow:hidden;}
+
+#hdr{background:var(--surface);border-bottom:1px solid var(--border);height:48px;
+  display:flex;align-items:center;gap:12px;padding:0 16px;position:relative;z-index:30;}
+.logo-square{width:26px;height:26px;background:var(--accent);display:flex;align-items:center;
+  justify-content:center;font-family:var(--mono);font-size:10px;font-weight:700;color:#000;}
+.logo-text{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--text-bright);letter-spacing:0.08em;}
+.logo-sub{font-size:9px;color:var(--text-dim);font-family:var(--mono);}
+.hdr-spacer{flex:1;}
+.hdr-badge{font-family:var(--mono);font-size:9px;color:var(--text-dim);padding:3px 8px;
+  border:1px solid var(--border);background:var(--bg);letter-spacing:0.06em;}
+
+#stage{position:absolute;top:48px;left:0;right:0;bottom:0;overflow:hidden;}
+.screen{position:absolute;inset:0;display:none;flex-direction:column;}
+.screen.active{display:flex;}
+
+#screen-intro{align-items:center;justify-content:center;padding:24px;text-align:center;overflow-y:auto;}
+.intro-wrap{max-width:440px;width:100%;}
+.intro-title{font-family:var(--mono);font-size:20px;font-weight:700;color:var(--text-bright);margin-bottom:10px;}
+.intro-sub{color:var(--text-dim);font-size:13px;line-height:1.6;margin-bottom:20px;}
+.intro-note{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--cyan);
+  padding:11px 14px;text-align:left;font-size:11.5px;color:var(--text);line-height:1.55;margin-bottom:20px;}
+.intro-steps{text-align:left;margin-bottom:24px;display:flex;flex-direction:column;gap:8px;}
+.istep{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--cyan);
+  padding:11px 14px;display:flex;gap:11px;align-items:flex-start;}
+.istep-n{font-family:var(--mono);font-size:15px;font-weight:700;color:var(--cyan);min-width:20px;}
+.istep-t{font-size:12px;color:var(--text);line-height:1.45;}
+.dev-row{display:flex;gap:8px;align-items:center;justify-content:center;margin-bottom:16px;flex-wrap:wrap;}
+.dev-row label{font-family:var(--mono);font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.06em;}
+select{background:var(--surface2);border:1px solid var(--border);color:var(--text-bright);
+  font-family:var(--mono);font-size:11px;padding:7px 9px;}
+.btn-primary{background:var(--accent);color:#000;border:none;padding:13px 40px;font-family:var(--mono);
+  font-size:12px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;cursor:pointer;
+  transition:filter 0.15s;width:100%;}
+.btn-primary:hover{filter:brightness(1.08);}
+.btn-primary:disabled{opacity:0.5;cursor:not-allowed;}
+.btn-ghost{background:transparent;color:var(--cyan);border:1px solid var(--cyan);padding:10px 22px;
+  font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;cursor:pointer;}
+.err-note{color:var(--red);font-family:var(--mono);font-size:11px;margin-top:14px;line-height:1.5;min-height:16px;}
+
+#screen-capture{background:#000;}
+#cam-area{position:relative;flex:1;overflow:hidden;background:#000;
+  display:flex;align-items:center;justify-content:center;}
+#video{max-width:100%;max-height:100%;display:block;}
+#video.mirror{transform:scaleX(-1);}
+#prompt-bar{position:absolute;top:0;left:0;right:0;padding:14px 16px;
+  background:linear-gradient(to bottom,rgba(15,18,25,0.92),rgba(15,18,25,0));z-index:5;text-align:center;}
+#prompt-side{font-family:var(--mono);font-size:10px;letter-spacing:0.14em;text-transform:uppercase;
+  color:var(--accent);margin-bottom:3px;}
+#prompt-main{font-family:var(--mono);font-size:15px;font-weight:700;color:#fff;}
+#flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none;z-index:10;}
+#flash.fire{animation:flash 0.4s ease-out;}
+@keyframes flash{0%{opacity:0.85;}100%{opacity:0;}}
+
+/* manual shutter */
+#shutter-row{position:absolute;left:0;right:0;bottom:0;z-index:6;padding:18px 12px 26px;
+  background:linear-gradient(to top,rgba(15,18,25,0.95),rgba(15,18,25,0));
+  display:flex;align-items:center;justify-content:center;}
+#btn-shutter{width:68px;height:68px;border-radius:50%;background:#fff;border:4px solid rgba(255,255,255,0.35);
+  cursor:pointer;transition:transform 0.1s;}
+#btn-shutter:active{transform:scale(0.92);}
+
+/* freeze-frame review overlay, shown after a shutter press */
+#review{position:absolute;inset:0;z-index:15;display:none;flex-direction:column;background:#000;}
+#review.show{display:flex;}
+#review-canvas-wrap{flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000;}
+#review-canvas-wrap img{max-width:100%;max-height:100%;display:block;}
+#review-actions{padding:16px;display:flex;gap:10px;background:var(--surface);border-top:1px solid var(--border);}
+#review-actions button{flex:1;}
+#review-label{position:absolute;top:14px;left:0;right:0;text-align:center;font-family:var(--mono);
+  font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-dim);z-index:1;}
+
+/* Result */
+#screen-result{padding:20px;overflow-y:auto;align-items:center;}
+.result-wrap{max-width:460px;width:100%;}
+.result-title{font-family:var(--mono);font-size:16px;font-weight:700;color:var(--green);
+  margin-bottom:4px;text-align:center;}
+.result-sub{color:var(--text-dim);font-size:12px;text-align:center;margin-bottom:20px;line-height:1.5;}
+.shots{display:flex;gap:12px;margin-bottom:14px;}
+.shot{flex:1;}
+.shot-lbl{font-family:var(--mono);font-size:9px;letter-spacing:0.08em;text-transform:uppercase;
+  color:var(--text-dim);margin-bottom:5px;}
+.shot img{width:100%;border:1px solid var(--border);display:block;}
+.video-block{margin-bottom:18px;}
+.video-block video{width:100%;border:1px solid var(--border);display:block;background:#000;}
+.payload-box{background:#0A0D14;border:1px solid var(--border);padding:12px;font-family:var(--mono);
+  font-size:10px;color:var(--text);white-space:pre-wrap;word-break:break-word;max-height:280px;
+  overflow-y:auto;margin-bottom:8px;line-height:1.5;}
+.payload-lbl{font-family:var(--mono);font-size:9px;letter-spacing:0.08em;text-transform:uppercase;
+  color:var(--text-dim);margin-bottom:6px;display:flex;justify-content:space-between;}
+.result-actions{display:flex;gap:10px;margin-top:14px;}
+.result-actions button{flex:1;}
+.silent-tag{color:var(--cyan);font-size:9px;}
+</style>
+</head>
+<body>
+
+<div id="hdr">
+  <div class="logo-square">S</div>
+  <div>
+    <div class="logo-text">SAFE</div>
+    <div class="logo-sub">DOCUMENT CAPTURE — OTHER</div>
+  </div>
+  <div class="hdr-spacer"></div>
+  <div class="hdr-badge">MANUAL CAPTURE</div>
+</div>
+
+<div id="stage">
+
+  <!-- INTRO -->
+  <div class="screen active" id="screen-intro">
+    <div class="intro-wrap">
+      <div class="intro-title">Photograph your document</div>
+      <div class="intro-sub">This document type doesn't have an automated capture path, so you'll take the photos yourself: frame the front, tap to capture, confirm or retake, then flip it over and do the same for the back.</div>
+      <div class="intro-note">No barcode or machine-readable text is decoded for this document type. Your photos are still checked for capture-quality signals (screen-recapture, replay) alongside the rest of your session.</div>
+      <div class="intro-steps">
+        <div class="istep"><div class="istep-n">1</div><div class="istep-t">Front of the document — fill the frame, then tap the shutter.</div></div>
+        <div class="istep"><div class="istep-n">2</div><div class="istep-t">Confirm the shot looks good, or retake it.</div></div>
+        <div class="istep"><div class="istep-n">3</div><div class="istep-t">Flip to the back and repeat.</div></div>
+      </div>
+      <div class="dev-row">
+        <label for="cam-select">Camera</label>
+        <select id="cam-select"><option value="">Default (rear preferred)</option></select>
+      </div>
+      <button class="btn-primary" id="btn-start">Enable camera &amp; begin</button>
+      <div class="err-note" id="intro-err"></div>
+    </div>
+  </div>
+
+  <!-- CAPTURE -->
+  <div class="screen" id="screen-capture">
+    <div id="cam-area">
+      <video id="video" autoplay playsinline muted></video>
+      <div id="prompt-bar">
+        <div id="prompt-side">FRONT OF DOCUMENT</div>
+        <div id="prompt-main">Fill the frame, then tap the shutter</div>
+      </div>
+      <div id="shutter-row"><button id="btn-shutter" aria-label="Take photo"></button></div>
+      <div id="flash"></div>
+    </div>
+    <div id="review">
+      <div id="review-label"></div>
+      <div id="review-canvas-wrap"><img id="review-img" alt="captured frame"></div>
+      <div id="review-actions">
+        <button class="btn-ghost" id="btn-retake">Retake</button>
+        <button class="btn-primary" id="btn-accept">Looks good →</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- RESULT -->
+  <div class="screen" id="screen-result">
+    <div class="result-wrap">
+      <div class="result-title">Both sides captured</div>
+      <div class="result-sub">Manually captured — no structured verification is attempted for this document type. Front, back, and the flip between them are on record for review.</div>
+      <div class="shots">
+        <div class="shot"><div class="shot-lbl">Front</div><img id="shot-front" alt="front"></div>
+        <div class="shot"><div class="shot-lbl">Back</div><img id="shot-back" alt="back"></div>
+      </div>
+      <div class="video-block" id="flip-video-wrap" style="display:none;">
+        <div class="shot-lbl">Flip (continuous recording, front → back)</div>
+        <video id="flip-video" controls playsinline></video>
+      </div>
+      <div class="payload-lbl"><span>Signal payload <span class="silent-tag">(rides into /cases body as captureSignals)</span></span></div>
+      <div class="payload-box" id="payload-json"></div>
+      <div class="result-actions">
+        <button class="btn-ghost" id="btn-restart">Recapture</button>
+        <button class="btn-primary" id="btn-copy" style="width:auto;">Copy payload</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+"use strict";
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 0 — CONFIG
+   ════════════════════════════════════════════════════════════════════════ */
+const BUILD_VERSION = 'v68.16';
+// Rolling background sample: how often we grab a cheap downscaled frame
+// into the ring buffer, and how many recent samples we keep. 6 to match
+// the "of 6/6 frames" convention already established by every autocapture
+// burst elsewhere in this app (see e.g. lockSide() in safe_idv_capture) --
+// same signals, same sample size, just gathered continuously in the
+// background instead of during a quality-gate dwell window, since there is
+// no dwell window here.
+const SAMPLE_INTERVAL_MS = 220;
+const SAMPLE_BUFFER_SIZE = 6;
+const ANALYSIS_WIDTH = 480; // matches CONFIG.analysisWidth elsewhere -- cheap, consistent
+const VIRTUAL_CAM_NAMES = ['obs','manycam','snap camera','snapcam','xsplit','camtwist',
+  'droidcam','iriun','epoccam','ivcam','virtual','ndi','ecamm'];
+
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 1 — PURE ANALYSIS FUNCTIONS
+   Copied verbatim from safe_idv_capture's own SECTION 1 -- these are
+   deliberately DOM-free/side-effect-free (raw pixel arrays in, numbers
+   out), so they carry over unchanged: none of them assume a card shape or
+   a detected document region, they operate on whatever gray/rgba array
+   they're handed. See that file's SECTION 1 header comment for the
+   original design rationale and unit-test precedent.
+   ════════════════════════════════════════════════════════════════════════ */
+function toGray(rgba, w, h){
+  const g = new Float32Array(w*h);
+  for(let i=0,p=0;i<g.length;i++,p+=4){
+    g[i] = 0.299*rgba[p] + 0.587*rgba[p+1] + 0.114*rgba[p+2];
+  }
+  return g;
+}
+function laplacianVariance(gray, w, h){
+  let sum=0, sumSq=0, n=0;
+  for(let y=1;y<h-1;y++){
+    for(let x=1;x<w-1;x++){
+      const i=y*w+x;
+      const lap = 4*gray[i] - gray[i-1] - gray[i+1] - gray[i-w] - gray[i+w];
+      sum+=lap; sumSq+=lap*lap; n++;
+    }
+  }
+  if(!n) return 0;
+  const mean=sum/n;
+  return sumSq/n - mean*mean;
+}
+function fft1d(re, im){
+  const n=re.length;
+  for(let i=1,j=0;i<n;i++){
+    let bit=n>>1;
+    for(;j&bit;bit>>=1) j^=bit;
+    j^=bit;
+    if(i<j){[re[i],re[j]]=[re[j],re[i]];[im[i],im[j]]=[im[j],im[i]];}
+  }
+  for(let len=2;len<=n;len<<=1){
+    const ang=-2*Math.PI/len;
+    const wr=Math.cos(ang), wi=Math.sin(ang);
+    for(let i=0;i<n;i+=len){
+      let cr=1, ci=0;
+      for(let k=0;k<len/2;k++){
+        const ur=re[i+k], ui=im[i+k];
+        const vr=re[i+k+len/2]*cr - im[i+k+len/2]*ci;
+        const vi=re[i+k+len/2]*ci + im[i+k+len/2]*cr;
+        re[i+k]=ur+vr; im[i+k]=ui+vi;
+        re[i+k+len/2]=ur-vr; im[i+k+len/2]=ui-vi;
+        const ncr=cr*wr - ci*wi; ci=cr*wi + ci*wr; cr=ncr;
+      }
+    }
+  }
+}
+function nextPow2(x){let p=1;while(p<x)p<<=1;return p;}
+function moireScore(gray, w, h){
+  const y0=Math.floor(h*0.35), y1=Math.floor(h*0.65);
+  const sig=new Float64Array(w);
+  for(let x=0;x<w;x++){
+    let s=0;for(let y=y0;y<y1;y++)s+=gray[y*w+x];
+    sig[x]=s/(y1-y0);
+  }
+  const N=nextPow2(w);
+  const re=new Float64Array(N), im=new Float64Array(N);
+  let mean=0;for(let x=0;x<w;x++)mean+=sig[x];mean/=w;
+  for(let x=0;x<w;x++)re[x]=sig[x]-mean;
+  fft1d(re,im);
+  const half=N>>1;
+  const mag=new Float64Array(half);
+  for(let k=0;k<half;k++)mag[k]=Math.hypot(re[k],im[k]);
+  const loEnd=Math.max(1,Math.floor(half*0.15));
+  const midStart=Math.floor(half*0.25), midEnd=Math.floor(half*0.85);
+  let loSum=0;for(let k=1;k<loEnd;k++)loSum+=mag[k];
+  const loMean=loSum/Math.max(1,loEnd-1);
+  let peak=0;for(let k=midStart;k<midEnd;k++)if(mag[k]>peak)peak=mag[k];
+  return loMean>1e-6 ? peak/loMean : 0;
+}
+function bandingScore(gray, w, h){
+  const rows=new Float64Array(h);
+  for(let y=0;y<h;y++){ let s=0; const b=y*w; for(let x=0;x<w;x++) s+=gray[b+x]; rows[y]=s/w; }
+  const win=Math.max(3, Math.round(h*0.08));
+  const det=new Float64Array(h);
+  for(let y=0;y<h;y++){
+    let s=0,n=0;
+    for(let k=-win;k<=win;k++){ const yy=y+k; if(yy>=0&&yy<h){ s+=rows[yy]; n++; } }
+    det[y]=rows[y]-s/n;
+  }
+  const N=nextPow2(h);
+  const re=new Float64Array(N), im=new Float64Array(N);
+  for(let y=0;y<h;y++) re[y]=det[y];
+  fft1d(re,im);
+  const half=N>>1;
+  const lo=Math.max(2,Math.floor(half*0.02)), hi=Math.max(lo+2,Math.floor(half*0.5));
+  let peak=0,sum=0,n=0;
+  for(let k=lo;k<hi;k++){ const m=Math.hypot(re[k],im[k]); if(m>peak)peak=m; sum+=m; n++; }
+  const meanMag=n?sum/n:0;
+  return meanMag>1e-9 ? peak/meanMag : 0;
+}
+function cellSignature(gray, w, h, N){
+  const cells=new Float64Array(N*N), bw=w/N, bh=h/N;
+  for(let by=0;by<N;by++){
+    for(let bx=0;bx<N;bx++){
+      const ax0=Math.floor(bx*bw), ax1=Math.max(ax0+1,Math.floor((bx+1)*bw));
+      const ay0=Math.floor(by*bh), ay1=Math.max(ay0+1,Math.floor((by+1)*bh));
+      let s=0,n=0;
+      for(let y=ay0;y<ay1;y++){ const b=y*w; for(let x=ax0;x<ax1;x++){ s+=gray[b+x]; n++; } }
+      cells[by*N+bx]=n?s/n:0;
+    }
+  }
+  return cells;
+}
+function aHash(gray, w, h){
+  const N=16, cells=cellSignature(gray,w,h,N), n=N*N;
+  let mean=0; for(let i=0;i<n;i++) mean+=cells[i]; mean/=n;
+  let hex='';
+  for(let i=0;i<n;i+=4){ let nib=0; for(let k=0;k<4;k++) if(cells[i+k]>mean) nib|=(1<<(3-k)); hex+=nib.toString(16); }
+  return hex;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 2 — DEVICE / VIRTUAL-CAMERA SIGNAL (silent, same as elsewhere)
+   ════════════════════════════════════════════════════════════════════════ */
+async function collectDeviceSignal(activeTrack){
+  const out = { virtualCameraSuspected:false, matchedName:null, labels:[], settings:null, capabilities:null };
+  try{
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const cams = devs.filter(d=>d.kind==='videoinput');
+    out.labels = cams.map(d=>d.label||'');
+    for(const label of out.labels){
+      const lc=label.toLowerCase();
+      const hit=VIRTUAL_CAM_NAMES.find(n=>lc.includes(n));
+      if(hit){ out.virtualCameraSuspected=true; out.matchedName=hit; break; }
+    }
+  }catch(e){ out.enumerateError = e.message; }
+  try{
+    if(activeTrack){
+      out.settings = activeTrack.getSettings ? activeTrack.getSettings() : null;
+      out.capabilities = activeTrack.getCapabilities ? activeTrack.getCapabilities() : null;
+      if(out.capabilities && Object.keys(out.capabilities).length<=1){
+        out.capabilitiesSuspicious = true;
+      }
+    }
+  }catch(e){ out.settingsError = e.message; }
+  return out;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 3 — CAMERA + STATE
+   ════════════════════════════════════════════════════════════════════════ */
+const els = {
+  screenIntro:  document.getElementById('screen-intro'),
+  screenCapture:document.getElementById('screen-capture'),
+  screenResult: document.getElementById('screen-result'),
+  video:   document.getElementById('video'),
+  camSelect:document.getElementById('cam-select'),
+  btnStart:document.getElementById('btn-start'),
+  introErr:document.getElementById('intro-err'),
+  promptSide:document.getElementById('prompt-side'),
+  promptMain:document.getElementById('prompt-main'),
+  flash:   document.getElementById('flash'),
+  btnShutter:document.getElementById('btn-shutter'),
+  review:  document.getElementById('review'),
+  reviewLabel:document.getElementById('review-label'),
+  reviewImg:document.getElementById('review-img'),
+  btnRetake:document.getElementById('btn-retake'),
+  btnAccept:document.getElementById('btn-accept'),
+  shotFront:document.getElementById('shot-front'),
+  shotBack:document.getElementById('shot-back'),
+  flipVideoWrap:document.getElementById('flip-video-wrap'),
+  flipVideo:document.getElementById('flip-video'),
+  payloadJson:document.getElementById('payload-json'),
+  btnRestart:document.getElementById('btn-restart'),
+  btnCopy: document.getElementById('btn-copy'),
+};
+
+const state = {
+  side: 'front',           // 'front' | 'back'
+  stream: null,
+  activeTrack: null,
+  running: false,
+  sampleBuffer: [],         // rolling {sharpness,luma,banding,hash} for the CURRENT side
+  sampleTimer: null,
+  captured: { front:null, back:null },
+  silent: { front:null, back:null },
+  deviceSignal: null,
+  pendingReviewDataUrl: null, // full-res capture awaiting Retake/Accept
+};
+
+const aCanvas = document.createElement('canvas'); // downscaled analysis
+const aCtx = aCanvas.getContext('2d', { willReadFrequently:true });
+const capCanvas = document.createElement('canvas'); // full-res capture
+const capCtx = capCanvas.getContext('2d');
+
+function showScreen(which){
+  [els.screenIntro,els.screenCapture,els.screenResult].forEach(s=>s.classList.remove('active'));
+  which.classList.add('active');
+}
+
+async function enumerateCameras(){
+  try{
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const cams = devs.filter(d=>d.kind==='videoinput');
+    els.camSelect.innerHTML = '<option value="">Default (rear preferred)</option>';
+    cams.forEach((c,i)=>{
+      const o=document.createElement('option');
+      o.value=c.deviceId; o.textContent=c.label||('Camera '+(i+1));
+      els.camSelect.appendChild(o);
+    });
+  }catch(e){/* labels need permission; fine pre-grant */}
+}
+
+async function startCamera(){
+  els.introErr.textContent='';
+  const chosen = els.camSelect.value;
+  // Same high-resolution/environment-facing reasoning as safe_idv_capture's
+  // startCamera() -- full native resolution matters for a legible full-res
+  // still even though there's no barcode to decode here; `ideal` is
+  // advisory so this costs nothing on a device that can't deliver it.
+  const constraints = {
+    audio:false,
+    video: chosen
+      ? { deviceId:{exact:chosen}, width:{ideal:3840}, height:{ideal:2160} }
+      : { facingMode:{ideal:'environment'}, width:{ideal:3840}, height:{ideal:2160} }
+  };
+  try{
+    state.stream = await navigator.mediaDevices.getUserMedia(constraints);
+  }catch(e){
+    try{ state.stream = await navigator.mediaDevices.getUserMedia({video:true,audio:false}); }
+    catch(e2){ els.introErr.textContent = 'Camera unavailable: '+(e2.message||e2.name)+'. On a phone this needs the https ngrok URL, not a plain http LAN address.'; return; }
+  }
+  els.video.srcObject = state.stream;
+  state.activeTrack = state.stream.getVideoTracks()[0];
+  let facing = '';
+  try{ facing = (state.activeTrack.getSettings && state.activeTrack.getSettings().facingMode) || ''; }catch(_){}
+  els.video.classList.toggle('mirror', facing === 'user');
+  await els.video.play().catch(()=>{});
+  state.deviceSignal = await collectDeviceSignal(state.activeTrack);
+  await enumerateCameras();
+  showScreen(els.screenCapture);
+  beginSide('front');
+  startFlipVideoRecording();
+  state.running = true;
+  startSampling();
+}
+
+function stopCamera(){
+  state.running=false;
+  stopSampling();
+  if(state.stream) state.stream.getTracks().forEach(t=>t.stop());
+  state.stream=null; state.activeTrack=null;
+}
+
+function beginSide(side){
+  state.side = side;
+  state.sampleBuffer = [];
+  els.promptSide.textContent = side==='front' ? 'FRONT OF DOCUMENT' : 'BACK OF DOCUMENT';
+  els.promptMain.textContent = side==='front'
+    ? 'Fill the frame, then tap the shutter' : 'Flip it over, fill the frame, then tap the shutter';
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 4 — ROLLING BACKGROUND SAMPLE (replaces the autocapture burst)
+   Every autocapture step elsewhere in this app builds its capture-
+   integrity signals (distinctFrameRatio, sharpnessCoV, lumaCoV,
+   bandingPeak) from a BURST of frames gathered during the quality-gate
+   dwell window (see safe_idv_capture's lockSide()). There is no dwell
+   window here -- the user decides when to shoot -- so instead this keeps
+   a small rolling buffer of recent lightweight samples running in the
+   background the whole time the camera is live, and the shutter press
+   just reads whatever's currently in the buffer. Same signals, same
+   buffer size (SAMPLE_BUFFER_SIZE=6, matching the "of 6/6 frames"
+   convention), gathered continuously rather than on-demand.
+   ════════════════════════════════════════════════════════════════════════ */
+function sampleTick(){
+  if(!state.running || !els.video.videoWidth) return;
+  const vw=els.video.videoWidth, vh=els.video.videoHeight;
+  const scale = ANALYSIS_WIDTH / vw;
+  const aw = ANALYSIS_WIDTH, ah = Math.round(vh*scale);
+  aCanvas.width=aw; aCanvas.height=ah;
+  aCtx.drawImage(els.video, 0,0, aw, ah);
+  let data;
+  try{ data = aCtx.getImageData(0,0,aw,ah).data; } catch(_){ return; }
+  const gray = toGray(data, aw, ah);
+  const sample = {
+    sharpness: laplacianVariance(gray, aw, ah),
+    luma: (function(){ let s=0; for(let i=0;i<gray.length;i++) s+=gray[i]; return s/gray.length; })(),
+    banding: bandingScore(gray, aw, ah),
+    hash: aHash(gray, aw, ah),
+  };
+  state.sampleBuffer.push(sample);
+  if(state.sampleBuffer.length > SAMPLE_BUFFER_SIZE) state.sampleBuffer.shift();
+}
+function startSampling(){ stopSampling(); state.sampleTimer = setInterval(sampleTick, SAMPLE_INTERVAL_MS); }
+function stopSampling(){ if(state.sampleTimer){ clearInterval(state.sampleTimer); state.sampleTimer=null; } }
+
+// Full-resolution still + the aggregate signals for whichever side is
+// current, computed from state.sampleBuffer at the moment of the shutter
+// press. Mirrors grabFullFrame()+lockSide()'s math in safe_idv_capture,
+// just triggered by a button instead of an auto-lock.
+function captureFullFrameAndSignals(){
+  const vw=els.video.videoWidth, vh=els.video.videoHeight;
+  capCanvas.width=vw; capCanvas.height=vh;
+  capCtx.drawImage(els.video,0,0,vw,vh);
+  const dataUrl = capCanvas.toDataURL('image/jpeg', 0.92);
+
+  let moireFull=null;
+  try{
+    const by0=Math.round(vh*0.40), bh=Math.max(8, Math.min(Math.round(vh*0.20), vh-by0));
+    const band=capCtx.getImageData(0,by0,vw,bh);
+    moireFull=+moireScore(toGray(band.data,vw,bh),vw,bh).toFixed(3);
+  }catch(_){}
+
+  const buf = state.sampleBuffer;
+  const cov=(arr)=>{ if(!arr.length) return 0; const m=arr.reduce((a,b)=>a+b,0)/arr.length;
+    if(!m) return 0; const v=arr.reduce((a,b)=>a+(b-m)*(b-m),0)/arr.length; return Math.sqrt(v)/m; };
+  const sharpVals = buf.map(s=>s.sharpness);
+  const silent = {
+    burstFrames: buf.length,
+    sharpnessCoV: +cov(sharpVals).toFixed(3),
+    lumaCoV: +cov(buf.map(s=>s.luma||0)).toFixed(4),
+    bandingPeak: buf.length ? +Math.max.apply(null, buf.map(s=>s.banding||0)).toFixed(2) : 0,
+    moireScoreFullRes: moireFull,
+    frameHashes: buf.map(s=>s.hash),
+    distinctFrameRatio: buf.length ? +(new Set(buf.map(s=>s.hash)).size/buf.length).toFixed(3) : null,
+  };
+  return { dataUrl, silent };
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 5 — FLIP VIDEO (continuous, front shutter through back shutter)
+   Same MediaRecorder pattern as safe_idv_capture's tilt-gesture video and
+   the passport booklet's opening-gesture video -- reads from the SAME
+   state.stream already in use, fails soft on any unsupported browser.
+   Started once camera comes up, stopped once the back shot is accepted --
+   spans BOTH shutter presses and any retakes in between, so the front and
+   back stills are provably frames from one unbroken recording.
+   ════════════════════════════════════════════════════════════════════════ */
+const FLIP_VIDEO_BITRATE = 800000;
+let flipVideoRecorder = null;
+let flipVideoChunks = [];
+let flipVideoBlob = null;
+let flipVideoReadyResolve = null;
+let flipVideoReadyPromise = null;
+
+function pickFlipVideoMimeType() {
+  if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported) return null;
+  const candidates = ['video/mp4;codecs=avc1', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+  for (const c of candidates) if (MediaRecorder.isTypeSupported(c)) return c;
+  return null;
+}
+function startFlipVideoRecording() {
+  flipVideoBlob = null;
+  flipVideoChunks = [];
+  flipVideoReadyPromise = new Promise(resolve => { flipVideoReadyResolve = resolve; });
+  const mimeType = pickFlipVideoMimeType();
+  if (!mimeType || !state.stream) { flipVideoReadyResolve(); return; }
+  try {
+    flipVideoRecorder = new MediaRecorder(state.stream, { mimeType, videoBitsPerSecond: FLIP_VIDEO_BITRATE });
+    flipVideoRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) flipVideoChunks.push(e.data); };
+    flipVideoRecorder.start();
+  } catch (e) {
+    flipVideoRecorder = null;
+    console.warn('flip video start failed:', e.message);
+    flipVideoReadyResolve();
+  }
+}
+function stopFlipVideoRecording() {
+  const rec = flipVideoRecorder;
+  flipVideoRecorder = null;
+  if (!rec) { if (flipVideoReadyResolve) flipVideoReadyResolve(); return; }
+  const mimeType = rec.mimeType || 'video/webm';
+  rec.onstop = () => {
+    if (flipVideoChunks.length) flipVideoBlob = new Blob(flipVideoChunks, { type: mimeType });
+    flipVideoChunks = [];
+    if (flipVideoReadyResolve) flipVideoReadyResolve();
+  };
+  try {
+    if (rec.state !== 'inactive') rec.stop();
+    else if (flipVideoReadyResolve) flipVideoReadyResolve();
+  } catch (e) {
+    console.warn('flip video stop failed:', e.message);
+    if (flipVideoReadyResolve) flipVideoReadyResolve();
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 6 — SHUTTER / REVIEW / RETAKE
+   ════════════════════════════════════════════════════════════════════════ */
+function fireFlash(){ els.flash.classList.remove('fire'); void els.flash.offsetWidth; els.flash.classList.add('fire'); }
+
+function onShutter(){
+  if(!els.video.videoWidth) return;
+  fireFlash();
+  const { dataUrl, silent } = captureFullFrameAndSignals();
+  state.pendingReviewDataUrl = dataUrl;
+  state.pendingReviewSilent = silent;
+  els.reviewImg.src = dataUrl;
+  els.reviewLabel.textContent = state.side==='front' ? 'FRONT OF DOCUMENT' : 'BACK OF DOCUMENT';
+  els.review.classList.add('show');
+}
+function onRetake(){
+  state.pendingReviewDataUrl = null;
+  state.pendingReviewSilent = null;
+  els.review.classList.remove('show');
+  // Sample buffer intentionally NOT cleared -- a retake is still the same
+  // physical framing attempt, and the rolling buffer just keeps accumulating.
+}
+function onAccept(){
+  state.captured[state.side] = state.pendingReviewDataUrl;
+  state.silent[state.side] = state.pendingReviewSilent;
+  els.review.classList.remove('show');
+  if(state.side === 'front'){
+    beginSide('back');
+  } else {
+    finish();
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 7 — PAYLOAD / FINISH
+   ════════════════════════════════════════════════════════════════════════ */
+function buildPayload(){
+  return {
+    schemaVersion: 'autocapture-1',
+    buildVersion: BUILD_VERSION,
+    capturedAt: new Date().toISOString(),
+    docType: 'other',
+    captureMode: 'manual',
+    // No barcode/MRZ field at all -- unlike every other capture file's
+    // payload, there is deliberately nothing here claiming a decode was
+    // attempted. See safe_idv_report's rendering of docType 'other' for
+    // how this shows up (or rather, doesn't) in the reviewer-facing report.
+    front: state.silent.front,
+    back: state.silent.back,
+    device: state.deviceSignal ? {
+      virtualCameraSuspected: state.deviceSignal.virtualCameraSuspected,
+      matchedName: state.deviceSignal.matchedName,
+      settings: state.deviceSignal.settings,
+      capabilitiesSuspicious: state.deviceSignal.capabilitiesSuspicious||false,
+    } : null,
+    note: 'No structured document verification (barcode/MRZ decode, or any automated legitimacy assessment) is attempted for this document type. Capture-integrity signals are provided for manual review, same as every other document type.',
+    liveCaptureEnforced: true,
+  };
+}
+
+async function finish(){
+  stopFlipVideoRecording();
+  stopCamera();
+  els.shotFront.src = state.captured.front;
+  els.shotBack.src = state.captured.back;
+  const payload = buildPayload();
+  els.payloadJson.textContent = JSON.stringify(payload, null, 2);
+  showScreen(els.screenResult);
+
+  await Promise.race([flipVideoReadyPromise, new Promise(resolve => setTimeout(resolve, 2000))]);
+  if(flipVideoBlob){
+    els.flipVideo.src = URL.createObjectURL(flipVideoBlob);
+    els.flipVideoWrap.style.display = '';
+  }
+
+  // ── SLOT-IN HOOK (active) ── same pattern as every other capture file:
+  // report to the parent iframe if embedded, no-op if opened standalone.
+  if (window.parent && window.parent !== window) {
+    try {
+      window.parent.postMessage({
+        type: 'safeAutocaptureComplete',
+        images: {
+          frontImage: state.captured.front,
+          backImage: state.captured.back,
+          // Report-page-only artifact, same precedent as tiltGestureVideo/
+          // openingGestureVideo elsewhere -- vision APIs take images, not
+          // video, so this never rides into the live engine call.
+          flipVideo: flipVideoBlob || null,
+        },
+        captureSignals: payload,
+      }, '*'); // demo: same-origin in practice; production should pass the real parent origin instead of '*'
+    } catch (e) {
+      console.warn('safeAutocaptureComplete postMessage failed:', e.message);
+    }
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   SECTION 8 — WIRING
+   ════════════════════════════════════════════════════════════════════════ */
+els.btnStart.addEventListener('click', startCamera);
+els.btnShutter.addEventListener('click', onShutter);
+els.btnRetake.addEventListener('click', onRetake);
+els.btnAccept.addEventListener('click', onAccept);
+els.btnRestart.addEventListener('click', ()=>{
+  state.captured = { front:null, back:null };
+  state.silent = { front:null, back:null };
+  flipVideoBlob = null;
+  els.flipVideoWrap.style.display = 'none';
+  showScreen(els.screenIntro);
+});
+els.btnCopy.addEventListener('click', async ()=>{
+  try{ await navigator.clipboard.writeText(els.payloadJson.textContent); }
+  catch(_){ try{ window.prompt('Copy payload (⌘/Ctrl+C):', els.payloadJson.textContent); }catch(__){} }
+});
+navigator.mediaDevices?.enumerateDevices && enumerateCameras();
+</script>
+</body>
+</html>

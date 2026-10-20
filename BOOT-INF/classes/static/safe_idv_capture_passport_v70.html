@@ -1,0 +1,2076 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>SAFE — Passport Capture</title>
+<!--
+  v67.1 — PASSPORT (BOOKLET) CAPTURE PATH — first build on the new decimal
+  versioning track (see safe_idv_launch_v70.html's head comment: vNN stays
+  the DL/primary track, vNN.# is the passport/alt-document-type track).
+  ====================================================================
+  Scope of this file: capture ONLY the passport's photo/biographic page and
+  read its MRZ (Machine Readable Zone) -- the selfie/liveness step already
+  ran in safe_idv_liveness_v70.html before this file ever loads, same as
+  the DL path. This file's only job is the document side.
+
+  MRZ OCR approach: Tesseract.js (Apache-2.0) loaded from a CDN, using a
+  custom OCR-B-trained model rather than the default English model -- the
+  default model measurably struggles with MRZ's specific 37-character set
+  (A-Z, 0-9, '<') and OCR-B font. The approach (custom Tesseract model +
+  vanilla JS, no build step) follows the ISC-licensed eringen/web-mrz-reader
+  reference implementation. IMPORTANT DEPLOYMENT NOTE: the actual
+  mrz.traineddata.gz asset is NOT bundled in this build -- it needs to be
+  downloaded from that repo (ISC license, safe for commercial use) and
+  placed in this app's Resources folder alongside this file before this
+  reaches full accuracy. Without it, this file falls back to Tesseract's
+  stock English model (TESSERACT_MODEL_FALLBACK below), which will still
+  attempt MRZ reads but with meaningfully worse accuracy -- it degrades
+  gracefully rather than failing to load. A dedicated MRZ AGPL-licensed
+  library (mrz-scanner) was considered and deliberately rejected -- AGPL's
+  network-use copyleft clause is a real problem for a commercial product,
+  so it was not used anywhere in this file.
+
+  Physical-presence signal for a booklet: unlike the DL/card path (which
+  uses a tilt gesture to catch OVI/hologram color-shift -- not applicable
+  here since a passport photo page doesn't have that feature, and tilting a
+  bound booklet is physically awkward), this file asks the applicant to
+  show the passport CLOSED, then OPEN it to the photo page, while camera
+  motion (frame-to-frame pixel differencing, not true optical flow -- see
+  computeFrameMotionMagnitude()'s comment) and device motion (IMU) are
+  correlated across that gesture. This is the same underlying idea as the
+  liveness step's IMU-vs-optical correlation check (real hand-held motion
+  produces correlated signals; a flat photo or screen replay doesn't),
+  applied to the document-handling gesture instead of the face challenges.
+  It is NOT full document-cover image recognition (that would need a
+  trained classifier this build doesn't have) -- it is a motion-based
+  steady -> deliberate-motion -> steady state machine, honestly scoped as
+  exactly that in the capture signals this file reports.
+
+  Explicitly OUT of scope for v67.1 (deferred to a later .# build): the
+  rigid US passport CARD variant (which should reuse the DL path's tilt
+  gesture instead of this file's open/close gesture), visas, and other
+  non-DL/non-passport document types. The ID-type interview in
+  safe_idv_launch_v70.html shows these as selectable options with a
+  clear "not yet supported in this build" message rather than routing here.
+
+  No NFC/chip reading of any kind happens in this file -- that is a
+  separate, native-app-only track, deliberately parked (see the NFC
+  recap document from the same planning conversation as this build).
+
+  v67.3 fixes (all from real-device testing feedback on v67.2):
+  1. initTesseract() was calling the v2-v4 Tesseract.js API
+     (createWorker() with no language, then loadLanguage()/initialize())
+     while loading the v5 CDN bundle -- v5 made those two methods no-ops,
+     so the OCR worker was very likely never loading ANY language data at
+     all. Rewritten to pass the language directly into
+     createWorker(lang, oem, options) per the v5 docs, with langPath
+     resolved to an absolute URL (this page's own directory) rather than a
+     bare relative path, since Tesseract.js workers run from a separate
+     blob: URL context where relative paths can resolve against the wrong
+     base.
+  2. drawGuideOverlay() showed the inside-photo-page guide (head
+     silhouette + MRZ ghost text) even during prep_countdown/steady_closed,
+     i.e. while the applicant was being asked to hold the passport CLOSED.
+     Now branches on state: a plain "passport closed, cover facing camera"
+     guide until opening_motion begins, then the existing inside-page guide.
+  3. Added a real on-screen debug panel (toggled via the DEBUG button in
+     the top bar) exposing live motion magnitude vs. thresholds, IMU
+     availability/sample count, current state and time-in-state, Tesseract
+     model status, OCR attempt count, and the last raw OCR text -- the
+     #mrzDebug element existed in the markup from an earlier build but was
+     never wired up to anything.
+
+  v67.4 fixes (from real-device debug-panel telemetry captured on v67.3):
+  1. The debug panel itself showed the actual bug: state was stuck in
+     steady_closed for 88+ seconds with motion=0.0356, comfortably above the
+     old MOTION_STEADY_THRESHOLD (0.02) despite the passport sitting
+     completely still. Real handheld-camera frame-to-frame noise (exposure/
+     focus micro-adjustment, sensor noise) never actually settled below that
+     threshold, so "steady" could never be confirmed and the flow could
+     never progress to opening_motion. Fixed by raising the threshold to sit
+     above the observed noise floor and adding a short moving-average
+     (smoothMotion()) so a single noisy frame can't reset the steady timer.
+  2. No way to get the debug panel's contents off the phone to share back --
+     tapping the panel now copies its text to the clipboard (with a
+     non-secure-context fallback), which is how the data above was gathered
+     in the first place.
+
+  v67.5 additions (three-image evidence sequence, requested before Erik's
+  next round of hardware testing):
+  1. Now captures THREE images per attempt instead of one: closedCoverImage
+     (grabbed the instant steadiness is confirmed, right before the applicant
+     starts opening the book), bothPagesImage (grabbed once at a fixed point
+     partway through the opening gesture -- deliberately a fixed offset
+     rather than trying to detect "the best moment", same cheap-proxy
+     philosophy as the rest of this file), and the existing final photo-page
+     crop (frontImage, unchanged). The middle shot exists purely as human-
+     reviewable evidence that a real bound booklet was handled, not a flat
+     photo -- something a reviewer can eyeball directly, complementing (not
+     replacing) the numeric IMU/motion correlation already computed.
+  2. Added a standalone test mode (isStandalone / showStandaloneResults())
+     so this file can be opened directly -- skipping the interview and
+     liveness steps entirely -- for iterating on motion-threshold tuning
+     without repeating the whole flow each time. Reachable via a link on
+     safe_idv_setup_v70.html.
+
+  v67.6 fix (direct correction on the v67.5 "both pages" guide):
+  v67.5's spread guide was a wide/short LANDSCAPE band (same orientation as
+  the single-page box, just wider) with a left/right divider -- backwards
+  from what was wanted. Corrected to a near-full-screen box with a TOP/
+  BOTTOM split instead: the applicant rotates the open book so its spine
+  runs horizontally, which fills a portrait phone frame far better than a
+  landscape two-page spread would. See computeSpreadGuideRect() and
+  drawSpreadGuide() below.
+
+  v67.7 addition (closed-cover ghost content):
+  Direct question before the next test round: is the national emblem/
+  "PASSPORT" title actually guaranteed to be visible in the closed-cover
+  shot, and should the guide indicate orientation? Added
+  drawCoverGhostContent() -- a dashed emblem placeholder plus a vertical
+  "PASSPORT" ghost label along the box's left edge, based on the same
+  rotation logic as the final photo-page shot (this guide box is landscape,
+  so the applicant rotates the naturally-portrait closed booklet 90° to fill
+  it -- once rotated, the title reads top-to-bottom along one edge rather
+  than across the middle). Instruction copy also now explicitly calls out
+  keeping the emblem/title visible. If the rotation assumption is wrong on
+  real hardware, drawCoverGhostContent()/computeSinglePageGuideRect() are
+  the places to revisit -- this step alone could go back to a portrait box.
+
+  v67.8 fixes/additions (direct correction round on v67.7's real-hardware
+  test screenshot -- Erik pointed out the Closed Cover and Both Pages (Open)
+  thumbnails showed the document in the SAME orientation, i.e. still closed
+  in both, confirming the bug described below):
+  1. computeSpreadGuideRect() was still an independently-guessed formula
+     (w*0.92, h*0.8) even after v67.6's orientation fix -- Erik's simpler,
+     geometrically-derived correction: the spread box is just TWO copies of
+     computeSinglePageGuideRect() stacked (same width, double height, same
+     horizontal AND vertical centering), not a separately-guessed aspect.
+     Rewritten to call computeSinglePageGuideRect() directly rather than
+     hand-picking numbers -- this is also why the old aspect never quite
+     looked right, it was never derived from the box it was supposed to be
+     twice the size of.
+  2. THE ACTUAL BUG behind "both pages" capturing a still-closed passport:
+     bothPagesImage was grabbed on a fixed timer (half of
+     MIN_OPENING_GESTURE_MS into opening_motion) instead of on any real
+     signal that opening had happened. A slow or hesitant real-world open
+     easily takes longer than that timer, so the shot fired while the book
+     was still closed. Fixed by moving the capture to fire at the exact
+     instant of the SAME state-transition condition that already exists for
+     leaving opening_motion (sawBurst && steadyLongEnough &&
+     gestureOldEnough) -- reusing the state machine's own "the gesture is
+     actually done" signal instead of an independent guess at timing.
+  3. Instruction copy for the opening step now explicitly says fingers near
+     the edges (holding the book open) are expected and fine -- no attempt
+     to detect or reject obstruction, same "don't build what you can't
+     honestly measure" approach as everywhere else in this file.
+  4. Amber/green readiness color state added to both the closed-cover and
+     spread guide boxes (dashed amber "HOLD STEADY" -> solid green "STEADY"
+     once the steadiness timer now driving each state's own capture has
+     actually started accumulating) -- adapted from the DL flow's
+     detected/locked color pattern (safe_idv_capture_v70.html), though
+     there is no real document-edge detection here, only this file's
+     existing motion-steadiness signal repurposed as the readiness cue.
+  5. Added a brief white capture-flash at each of the three shutter moments
+     (closed cover, both pages, final photo page) -- same #flash technique
+     as the DL flow (fireFlash()), a literal camera-flash visual cue so it's
+     obvious a photo was actually taken at that instant, direct answer to
+     "I don't even know how the pic got taken when it did."
+  6. The guide box itself now animates through the opening and zoom
+     transitions (Erik's preferred approach over a separate corner widget):
+     on the steady_closed -> opening_motion transition, the box grows from
+     the closed single-page rect into the spread rect, biased to swing open
+     from the BOTTOM edge (US passport bound edge, per Erik's confirmation
+     that the spine sits at the bottom of this file's established rotated
+     orientation) -- the top edge moves first/faster, the bottom edge
+     follows and settles later. On the opening_motion -> mrz_ocr transition,
+     the box slides (no resize needed -- same width/height, see #7 below)
+     from the spread's bottom half up into the tight final single-page
+     position. Both are simple geometry interpolations over ANIM_DURATION_MS
+     -- not a physical hinge/perspective simulation, an "honest proxy"
+     animation in the same spirit as this file's motion-diff proxy.
+  7. Because the spread box is now derived (per #1) as exactly double the
+     single-page box's height at the same width, the spread's BOTTOM half
+     is pixel-identical in width/height to the final single-page box -- only
+     its Y position differs. That's what makes #6's zoom transition a pure
+     slide rather than a scale, and it's also why the spread's ghost content
+     (head-silhouette/MRZ-band hints, previously generic on both halves) now
+     biases toward that bottom half specifically -- it's the half that
+     becomes the photo/MRZ page once the applicant re-frames onto it.
+  8. drawCoverGhostContent()'s emblem placeholder was a plain dashed circle
+     -- direct request to make it read more clearly as the eagle seal shown
+     on an actual passport cover. Replaced with a simple low-res dashed
+     eagle silhouette (head + spread wings) in the same style/weight as the
+     rest of the ghost content -- still an abstract placeholder, not any
+     specific country's actual emblem design.
+
+  v67.9 fix (diagnosed from two real-device test exports, both stalling in
+  opening_motion for ~70-71 SECONDS before capturing the instant the tab was
+  foregrounded again after Erik checked a screenshot):
+  Root cause is NOT anything in the motion-threshold logic itself -- mobile
+  browsers fully suspend a backgrounded tab's requestAnimationFrame loop, so
+  mainLoop() simply did not run at all while the tab was hidden; nothing was
+  "waiting and failing to pass" during that gap. But steadySince and
+  openingWindowStart are compared against the real wall clock (Date.now()),
+  which keeps advancing regardless of whether the loop is running -- so the
+  very first frame after returning could find STEADY_MS_REQUIRED and/or
+  MIN_OPENING_GESTURE_MS already satisfied purely from elapsed BACKGROUND
+  time, with no live gesture actually observed during it. Compounding this:
+  if the camera feed itself also freezes while hidden (plausible -- phones
+  commonly suspend camera capture for backgrounded apps to save power), the
+  first post-return motion reading compares the live frame against a stale,
+  identical pre-hide frame in lastFrameData, reading as perfectly "steady"
+  for free rather than because anything was actually held still. Both
+  effects point the same direction: a background/foreground round-trip
+  could silently satisfy this file's physical-presence gesture without the
+  gesture happening while actually visible -- which undercuts the point of
+  the signal (see this file's own top-of-file description of what this
+  gesture is supposed to prove), not just a UX oddity. Fixed via a new
+  visibilitychange listener (onVisibilityChange()) that, on regaining
+  visibility, discards anything that could have accrued unobserved: resets
+  lastFrameData (so the next motion reading starts a fresh baseline instead
+  of diffing against a stale frame), resets steadySince (steadiness must be
+  re-earned live), and if still in opening_motion, restarts
+  openingWindowStart and motionSamples from scratch (the whole opening
+  gesture must run its full course again, in view). Also logs
+  visibility_hidden/visibility_visible/opening_gesture_restarted_after_hidden
+  events with the hidden duration, so this is directly confirmable in the
+  next exported test result rather than inferred from timestamps.
+
+  v67.10 (v67.9's fix didn't hold -- a THIRD real-device run stalled in
+  opening_motion for 127 seconds, longer than before, and this time the
+  screenshots Erik sent show the tab visibly foregrounded and the passport
+  visibly already open and held steady the ENTIRE time. That rules out
+  v67.9's backgrounding/visibility theory outright -- document.hidden never
+  would have gone true here, so that fix's reset code never even ran, yet
+  the exact same "stuck until a screenshot" symptom happened anyway):
+  New leading theory, simpler and more mundane than either previous one:
+  taking an iOS screenshot means physically pressing the side + volume
+  buttons on the phone being held -- a real physical jolt to the device,
+  plausibly enough on its own to register as the "burst" of motion
+  opening_motion has been waiting for the whole time. If a genuine, careful
+  two-handed opening motion doesn't produce as much frame-to-frame change
+  as an accidental button-press jolt does, MOTION_BURST_THRESHOLD (0.12,
+  picked without real opening-motion telemetry to check it against) may
+  simply be tuned for a more vigorous motion than people actually use to
+  open a bound passport. Two changes, deliberately not just one guess:
+  1. Lowered MOTION_BURST_THRESHOLD to 0.08 -- still comfortably above
+     MOTION_STEADY_THRESHOLD (0.05) and the ~0.03-0.04 idle noise floor
+     from the v67.4 fix, but more reachable by a real, unhurried open.
+     Flagged in its own comment as an informed-but-unconfirmed adjustment.
+  2. Added opening_motion_diag: a periodic sample (every
+     MOTION_DIAG_LOG_INTERVAL_MS, 1.5s) of the actual raw/smoothed motion
+     value and gate state while sitting in opening_motion, logged to
+     eventLog regardless of whether #1 turns out to be right. The goal
+     specifically: never again be reduced to guessing at a stall's cause
+     from timestamps and photos alone -- the next real-device export
+     should show the actual motion trace, confirming or ruling out #1 (and
+     anything else) directly.
+
+  v67.11 (v67.10's diagnostic logging worked exactly as intended -- the very
+  next real-device test showed 37 straight opening_motion_diag samples over
+  ~56 seconds, EVERY one sawBurst:false, while Erik was visibly, genuinely
+  handling an open passport the entire time; sawBurst only flipped true
+  within ~1.5s of him touching the phone itself to unlock it after an
+  accidental screen lock. That's conclusive, not just suggestive: not one
+  frame at full resolution crossed 0.08 -- or the original 0.12 -- during a
+  full minute of real handling, while incidental phone jolts crossed it
+  almost immediately, twice now across different sessions):
+  Root cause, now confirmed rather than guessed: computeFrameMotionMagnitude()
+  diffed the ENTIRE camera frame downsampled to 24x24 -- most of a typical
+  frame is stationary background (couch, table), which dilutes whatever
+  change a hand-sized document produces into near-nothing once averaged in.
+  No threshold number was ever going to fix that; the signal itself was too
+  weak for this gesture. Three changes, addressing detection, a hard safety
+  net, and evidence quality independently rather than betting everything on
+  one guess:
+  1. computeFrameMotionMagnitude() now takes a source rect and crops to the
+     CURRENT guide-box region (single-page box in steady_closed, spread box
+     in opening_motion -- see mainLoop()'s new motionRect) before
+     downsampling, concentrating the analysis on the area the document
+     actually occupies instead of the whole scene. A region CHANGE (e.g. the
+     state transition itself) resets lastFrameData first, so the crop
+     boundary change itself can't masquerade as motion.
+  2. New MAX_OPENING_WAIT_MS (10s) safety-net fallback (readyViaFallback):
+     even with #1, there's no real-device proof yet that a genuine burst
+     reliably registers -- so if one still hasn't after a much longer wait
+     than the normal MIN_OPENING_GESTURE_MS floor, but the scene has
+     genuinely been steady regardless, let it through anyway. Logged
+     distinctly (opening_gesture_fallback_used) so it's obvious on the next
+     test whether #1 is doing the real work or this backstop is covering
+     for it. This is what actually GUARANTEES no one gets stuck for 70-127
+     seconds again, regardless of whether #1 fully solves detection.
+  3. Added an actual opening-gesture VIDEO capture (MediaRecorder, ~800kbps,
+     started the instant closedCoverImage is captured, stopped the instant
+     the gesture is confirmed done) -- see openingGestureRecorder and
+     safe_idv_report_v70.html's videoSlotHtml(). This exists because the
+     motion-diff proxy, even improved, is still just a weak numeric proxy --
+     a human reviewer watching a few real seconds of the passport actually
+     being opened is far more convincing evidence than any score this file
+     could compute, the same reasoning that justified bothPagesImage back
+     in v67.5. Deliberately NOT included in sentImages/the live engine call
+     (vision APIs take images, not video) -- stays a report-page-only
+     artifact; see callIdvEngine()'s comment in the report file.
+
+  v67.12 (Erik tested v67.11's standalone mode: "it just opened a video
+  player and there was nowhere to navigate to" -- the plain inline <video>
+  added in v67.11 was triggering iOS Safari's NATIVE fullscreen video
+  player on tap, which has no relationship to this page's own UI, instead
+  of landing back on the usual images+JSON summary panel):
+  Root cause: mounting an interactive <video controls> directly inside a
+  scrollable results grid lets iOS Safari intercept the tap and hand off to
+  its own OS-level player chrome, with no route back into the page.
+  Fix: standaloneVideoFigure() no longer renders a <video> inline. It now
+  renders a clickable poster thumbnail (.video-thumb/.play-badge), reusing
+  bothPagesImage as a representative frame since it's captured ~300ms
+  before the clip ends -- same precedent as bothPagesImage's own role as
+  human-reviewable evidence (v67.5). The actual <video> element lives only
+  inside a new bounded, page-owned #videoModal overlay, opened on demand via
+  openVideoModal() and dismissed with its own explicit Close button
+  (closeVideoModal()) -- so it can be "launched if desired and closed to
+  return to the image summary" (Erik's exact words), and never becomes the
+  thing directly tapped inline. Applied the identical pattern proactively to
+  safe_idv_report_v70.html's videoSlotHtml(), which had the same latent
+  bug even though Erik hadn't hit it there yet.
+
+  v67.13 (Erik on v67.12: "how do i close the video after i play it?" --
+  followed up to confirm exactly what he was seeing: tapping the video
+  inside #videoModal went to iOS's native fullscreen player, with no way
+  back):
+  Root cause: v67.12's fix moved the <video> out of the results grid and
+  into a bounded modal, which stopped the ORIGINAL escape hatch (tapping
+  the video itself triggered fullscreen) -- but #videoModalPlayer still had
+  the `controls` attribute, and Safari's native controls bar has its OWN
+  fullscreen-expand icon. Tapping that icon (not the poster thumbnail, not
+  the video body) sent it into the same native fullscreen takeover one
+  layer deeper in, orphaning the Close button all over again.
+  Fix: removed `controls` entirely, so there's no native fullscreen icon
+  left to tap. Added a small custom play/pause toggle overlaid on the video
+  (toggleVideoModalPlayback(), driven by ensureVideoModalListeners()'s
+  play/pause/ended listeners updating the icon) so playback can still be
+  paused/resumed without any native chrome. Also added
+  onVideoModalFullscreenAttempt(), a defensive webkitbeginfullscreen
+  listener that immediately calls webkitExitFullscreen() as a backstop, in
+  case iOS ever triggers fullscreen through some other path (e.g. a
+  long-press) that removing `controls` alone doesn't cover. Applied
+  identically to safe_idv_report_v70.html's #videoModalPlayer.
+-->
+<style>
+:root{
+  --bg:#0F1219; --surface:#1A2233; --surface2:#212D42;
+  --border:#2A3A52; --border-light:#374d6b;
+  --text:#C8D6E8; --text-dim:#7A90AA; --text-bright:#E8F0F8;
+  --accent:#E8A020; --accent-dim:rgba(232,160,32,0.15); --accent-border:rgba(232,160,32,0.4);
+  --green:#3DB87A; --green-dim:rgba(61,184,122,0.12);
+  --red:#E85555; --red-dim:rgba(232,85,85,0.12);
+  --mono:'JetBrains Mono','Fira Code','Consolas',monospace;
+  --sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{background:#000;height:100%;overflow:hidden;font-family:var(--sans);}
+#stage{position:fixed;inset:0;background:#000;}
+video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
+#overlayCanvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;}
+#topBar{position:fixed;top:0;left:0;right:0;padding:16px 18px;z-index:6;
+  background:linear-gradient(rgba(0,0,0,0.65),transparent);
+  display:flex;align-items:center;justify-content:space-between;}
+.brand{font-family:var(--mono);font-size:11px;font-weight:700;color:var(--text-bright);letter-spacing:0.08em;}
+#debugToggle{background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.28);color:var(--text-dim);
+  font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:0.06em;padding:6px 9px;cursor:pointer;}
+#debugToggle.active{background:var(--accent-dim);border-color:var(--accent-border);color:var(--accent);}
+#instructions{position:fixed;left:0;right:0;bottom:0;z-index:5;padding:20px 20px 28px;
+  background:linear-gradient(transparent,rgba(0,0,0,0.85) 40%);color:var(--text-bright);text-align:center;}
+#instr-title{font-size:16px;font-weight:600;margin-bottom:6px;}
+#instr-body{font-size:13px;color:var(--text-dim);line-height:1.5;max-width:420px;margin:0 auto;}
+#progressDots{display:flex;justify-content:center;gap:6px;margin-top:14px;}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--border-light);}
+.dot.done{background:var(--green);}
+.dot.active{background:var(--accent);}
+#retryBtn{display:none;margin-top:14px;background:var(--accent);color:#000;border:none;padding:10px 22px;
+  font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;cursor:pointer;}
+#mrzDebug{position:fixed;top:56px;left:12px;right:12px;z-index:5;font-family:var(--mono);font-size:10px;
+  color:var(--green);background:rgba(15,18,25,0.88);border:1px solid rgba(61,184,122,0.3);
+  padding:8px 10px;display:none;max-height:34vh;overflow-y:auto;white-space:pre-wrap;line-height:1.6;
+  cursor:pointer;pointer-events:auto;}
+#blockedOverlay{position:fixed;inset:0;z-index:20;background:rgba(15,18,25,0.96);display:none;
+  flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:28px;color:var(--text-bright);}
+#blockedOverlay .icon{font-size:34px;margin-bottom:14px;}
+#blockedOverlay h2{font-size:16px;margin-bottom:8px;}
+#blockedOverlay p{font-size:13px;color:var(--text-dim);max-width:380px;line-height:1.5;margin-bottom:18px;}
+#blockedOverlay button{background:var(--accent);color:#000;border:none;padding:12px 26px;font-family:var(--mono);
+  font-size:11px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;cursor:pointer;}
+/* v67.5: standalone test-mode results -- only ever shown when this file is
+   opened directly (not inside the launch page's iframe), so there's no
+   parent around to hand the capture off to. See isStandalone/
+   showStandaloneResults() below. */
+#standaloneResults{position:fixed;inset:0;z-index:30;background:rgba(9,11,16,0.97);display:none;
+  overflow-y:auto;padding:24px 20px 40px;color:var(--text-bright);}
+#standaloneResults h2{font-size:16px;margin-bottom:4px;}
+#standaloneResults .sub{font-size:12px;color:var(--text-dim);margin-bottom:18px;}
+#standaloneImages{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:18px;}
+#standaloneImages figure{margin:0;background:var(--surface);border:1px solid var(--border);padding:6px;}
+#standaloneImages img{width:100%;display:block;background:#000;}
+#standaloneImages figcaption{font-family:var(--mono);font-size:9px;color:var(--text-dim);text-align:center;padding-top:5px;letter-spacing:0.04em;text-transform:uppercase;}
+#standaloneImages .empty{aspect-ratio:1.42;display:flex;align-items:center;justify-content:center;color:var(--text-dim);font-size:10px;font-family:var(--mono);}
+#standaloneJson{font-family:var(--mono);font-size:10px;color:var(--green);background:rgba(15,18,25,0.88);
+  border:1px solid rgba(61,184,122,0.3);padding:10px;white-space:pre-wrap;line-height:1.5;max-height:40vh;overflow-y:auto;margin-bottom:16px;}
+#standaloneResults button{background:var(--accent);color:#000;border:none;padding:12px 24px;font-family:var(--mono);
+  font-size:11px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;cursor:pointer;margin-right:8px;}
+/* v67.12 FIX: an inline <video> in this grid was triggering iOS Safari's
+   NATIVE fullscreen video player on tap -- an OS-level overlay with no
+   relation to this page's UI, so there was genuinely nowhere to navigate
+   back to (confirmed directly from Erik's report: "opened a video player
+   and there was nowhere to navigate to"). Replaced with a clickable poster
+   thumbnail (styled/sized exactly like the image figures above it) plus a
+   bounded, page-owned modal (#videoModal below) that opens on tap and has
+   its own Close button -- the video never gets a chance to request
+   fullscreen because it's never the thing that's tapped/played directly. */
+.video-thumb{position:relative;cursor:pointer;aspect-ratio:1.42;background:#000;overflow:hidden;}
+.video-thumb img{width:100%;height:100%;object-fit:cover;display:block;}
+.video-thumb .play-badge{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;}
+.video-thumb .play-badge::before{content:'▶';display:flex;align-items:center;justify-content:center;
+  width:40px;height:40px;border-radius:50%;background:rgba(0,0,0,0.6);border:1px solid rgba(255,255,255,0.5);
+  color:#fff;font-size:14px;padding-left:3px;}
+#videoModal{position:fixed;inset:0;z-index:40;background:rgba(0,0,0,0.94);display:none;
+  align-items:center;justify-content:center;flex-direction:column;padding:20px;}
+/* v67.13: the native `controls` bar on #videoModalPlayer had its own
+   fullscreen-expand icon -- tapping THAT (not the poster thumbnail) sent
+   the video into iOS Safari's OS-level fullscreen player, orphaning the
+   Close button below exactly the same way the original bug did (Erik:
+   confirmed this is what he hit). Fix: no native `controls` at all, so
+   there's no fullscreen icon to tap in the first place -- just a small
+   custom play/pause toggle overlaid on the video (see
+   toggleVideoModalPlayback()) and the existing page-owned Close button. */
+.video-modal-wrap{position:relative;max-width:100%;line-height:0;}
+#videoModal video{max-width:100%;max-height:72vh;background:#000;display:block;}
+.video-modal-toggle{position:absolute;left:10px;bottom:10px;width:38px;height:38px;border-radius:50%;
+  background:rgba(0,0,0,0.6);border:1px solid rgba(255,255,255,0.5);color:#fff;font-size:14px;
+  display:flex;align-items:center;justify-content:center;cursor:pointer;user-select:none;}
+#videoModal button{margin-top:16px;background:var(--accent);color:#000;border:none;padding:12px 24px;
+  font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;cursor:pointer;}
+/* v67.8: capture flash -- same technique as the DL flow's #flash (see
+   safe_idv_capture_v70.html's fireFlash()), a literal camera-flash visual
+   cue at each of the three shutter moments so it's obvious a photo was just
+   taken, not a silent background grab. */
+#flash{position:fixed;inset:0;background:#fff;opacity:0;pointer-events:none;z-index:10;}
+#flash.fire{animation:flash 0.4s ease-out;}
+@keyframes flash{0%{opacity:0.85;}100%{opacity:0;}}
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="overlayCanvas"></canvas>
+</div>
+<div id="flash"></div>
+
+<div id="topBar">
+  <div class="brand">SAFE — PASSPORT CAPTURE</div>
+  <button id="debugToggle" onclick="toggleDebug()">DEBUG</button>
+</div>
+<div id="mrzDebug" onclick="copyDebugToClipboard()"></div>
+
+<div id="instructions">
+  <div id="instr-title">Getting ready…</div>
+  <div id="instr-body">Requesting camera access.</div>
+  <div id="progressDots">
+    <div class="dot" id="dot-closed"></div>
+    <div class="dot" id="dot-open"></div>
+    <div class="dot" id="dot-mrz"></div>
+  </div>
+  <button id="retryBtn" onclick="retryFromTop()">Try Again</button>
+</div>
+
+<div id="blockedOverlay">
+  <div class="icon">⚠</div>
+  <h2 id="blocked-title">Camera Unavailable</h2>
+  <p id="blocked-body">This step needs camera access to capture your passport.</p>
+  <button onclick="location.reload()">Reload</button>
+</div>
+
+<!-- v67.5: standalone test-mode results panel -- see isStandalone below. -->
+<div id="standaloneResults">
+  <h2>Standalone Test Result</h2>
+  <div class="sub">Opened directly (no launch flow around this step) -- nothing was sent anywhere. This is exactly what would have been handed off.</div>
+  <div id="standaloneImages"></div>
+  <pre id="standaloneJson"></pre>
+  <!-- Full reload rather than retryFromTop() -- finalizeCapture() already
+       stopped the camera stream by the time this panel can appear, and
+       retryFromTop() (an existing, currently-unused code path) doesn't
+       reacquire it. A reload is simple and guaranteed clean. -->
+  <button onclick="location.reload()">Test Again</button>
+</div>
+
+<!-- v67.12: bounded, page-owned video player -- opened on demand from a
+     poster thumbnail in #standaloneImages (see openVideoModal()/
+     closeVideoModal() below), never an inline autoplaying <video> in the
+     grid itself, so it can't trigger iOS's native fullscreen takeover.
+     v67.13: no `controls` attribute either now -- see the CSS comment
+     above #videoModal for why (its native fullscreen icon was the actual
+     escape hatch). toggleVideoModalPlayback() drives the custom overlay
+     button instead. -->
+<div id="videoModal">
+  <div class="video-modal-wrap">
+    <video id="videoModalPlayer" playsinline webkit-playsinline="true" disablePictureInPicture onclick="toggleVideoModalPlayback()"></video>
+    <div class="video-modal-toggle" id="videoModalToggle" onclick="toggleVideoModalPlayback()">⏸</div>
+  </div>
+  <button onclick="closeVideoModal()">Close</button>
+</div>
+
+<script>
+"use strict";
+const BUILD_VERSION = 'v67.13';
+// v67.5: lets this file be opened directly for testing (e.g. from the setup
+// page's "Test passport capture directly" link) without going through the
+// interview/liveness steps first. window === window.top is true whenever
+// this document is the top-level browsing context -- safe to compare across
+// origins too, unlike touching window.top's properties. See
+// showStandaloneResults() / finalizeCapture() for what this changes.
+const isStandalone = (window === window.top);
+
+// ══════════════════════════════════════════════════════
+// CONFIG
+// ══════════════════════════════════════════════════════
+// Tesseract.js core + worker/language files from a CDN, same "no build step,
+// no bundler" pattern as BlazeFace/FaceMesh elsewhere in this app.
+const TESSERACT_CDN = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+// Custom OCR-B-trained model -- see the file-level comment above. Tesseract.js
+// expects a custom language's data file to be named '<lang>.traineddata.gz'
+// at langPath -- our asset is already named mrz.traineddata.gz and sits
+// alongside this HTML file, so lang 'mrz' + langPath = this page's own
+// directory resolves to exactly that file. See initTesseract() for the v5
+// API fix (v67.3) that made this actually load.
+const TESSERACT_MODEL_FALLBACK = 'eng'; // stock model, loaded from Tesseract's own CDN language-data if the custom one 404s
+// v67.4 FIX: MOTION_STEADY_THRESHOLD was 0.02 -- real-device debug-panel
+// telemetry from a genuinely motionless passport on a stable surface showed
+// the frame-diff proxy sitting around 0.03-0.04 (handheld-camera exposure
+// micro-adjustment and sensor noise, not real motion), so steady_closed
+// could never accumulate STEADY_MS_REQUIRED of continuous "steadiness" --
+// the flow was stuck there indefinitely. Two changes: raise the threshold
+// comfortably above that observed noise floor, and smooth the raw magnitude
+// over a few frames (see MOTION_SMOOTHING_WINDOW / smoothMotion() below)
+// so a single noisy frame can't reset the steady timer.
+const MOTION_STEADY_THRESHOLD = 0.05;   // smoothed frame-diff magnitude below this counts as "steady"
+// v67.10: lowered from 0.12 -- real-device testing (Erik, three separate
+// runs across v67.8/v67.9) showed opening_motion stalling for 70-127
+// SECONDS despite the passport visibly being opened and held steady the
+// whole time (confirmed NOT a backgrounding/visibility issue -- v67.9's
+// visibilitychange fix made no difference, and the screenshots show the
+// tab staying visible throughout). Leading theory: a genuine, careful
+// two-handed opening motion may simply never have been producing a
+// smoothed frame-diff above 0.12 -- gentler than we assumed when this
+// number was picked. 0.08 stays comfortably above both
+// MOTION_STEADY_THRESHOLD (0.05) and the ~0.03-0.04 idle noise floor
+// established during the v67.4 fix, while giving real motion meaningfully
+// more room to register. This is an INFORMED adjustment, not a confirmed
+// one -- see MOTION_DIAG_LOG_INTERVAL_MS below, added specifically so the
+// next real-device test's exported JSON shows the actual motion trace
+// during opening_motion and either confirms this or points somewhere else.
+const MOTION_BURST_THRESHOLD = 0.08;    // smoothed frame-diff magnitude above this counts as deliberate motion
+const MOTION_SMOOTHING_WINDOW = 5;      // frames averaged before comparing against the thresholds above
+// v67.10: periodic diagnostic sampling while stuck in opening_motion -- see
+// the logging call inside mainLoop()'s opening_motion branch. Independent
+// of MOTION_BURST_THRESHOLD above; exists purely so a stall shows up as an
+// actual motion trace in the exported event log rather than a silent gap
+// between closed_cover_captured and both_pages_captured.
+const MOTION_DIAG_LOG_INTERVAL_MS = 1500;
+// v67.2 FIX: this used to be STEADY_FRAMES_REQUIRED = 10, a raw
+// requestAnimationFrame COUNT rather than elapsed time -- at a typical 60Hz
+// (or higher, on ProMotion displays) refresh rate that's on the order of
+// 100-160ms, nowhere near enough time for a person to actually reposition a
+// physical document. That's what real-device testing caught: the flow raced
+// through the open/close gesture before the applicant could get the
+// passport in frame at all. Fixed by tracking real elapsed wall-clock time
+// instead of frame counts, with durations long enough for an actual human
+// to act on the instruction.
+const STEADY_MS_REQUIRED = 900;         // real elapsed ms of steadiness required to confirm a baseline
+const MIN_OPENING_GESTURE_MS = 1800;    // opening_motion can't complete faster than this even if sensor data would allow it
+// v67.11: safety-net fallback -- see readyViaFallback in mainLoop()'s
+// opening_motion branch. Deliberately much longer than MIN_OPENING_GESTURE_MS
+// so it's never the normal path, only a backstop against another indefinite
+// stall like the 70-127 second ones real testing already produced twice.
+const MAX_OPENING_WAIT_MS = 10000;
+const PREP_COUNTDOWN_MS = 4000;         // fixed lead-in before ANY detection starts, so there's always time to get the document in frame
+const MRZ_OCR_INTERVAL_MS = 1200;       // don't OCR every frame -- Tesseract is not free
+const MAX_OCR_ATTEMPTS_BEFORE_TIP = 8;
+
+// ══════════════════════════════════════════════════════
+// STATE
+// ══════════════════════════════════════════════════════
+let video, overlayCanvas, overlayCtx;
+let videoStream = null;
+// v67.2: added 'prep_countdown' as the very first real state (after camera
+// init) -- guide graphics are visible immediately during this phase so the
+// applicant can start positioning the document right away, but nothing is
+// actually being measured/timed against them yet.
+let state = 'init'; // init -> prep_countdown -> steady_closed -> opening_motion -> steady_open -> mrz_ocr -> complete
+let stateEnteredAt = Date.now(); // v67.3: tracked alongside `state` for the debug panel below
+let ocrAttempts = 0;
+let tesseractWorker = null;
+let usingFallbackModel = false;
+let sessionStartMs = Date.now();
+let prepCountdownStartedAt = null;
+// v67.3: on-screen debug panel state -- see toggleDebug()/updateDebugPanel().
+let debugVisible = false;
+let lastOcrRawText = '';
+
+// Motion tracking -- v67.2: steadyFrameStreak (a frame COUNT) replaced with
+// steadySince (a TIMESTAMP), so "how long have we been steady" is measured
+// in real time regardless of the device's actual frame rate.
+let lastFrameData = null;
+let steadySince = null;
+let motionSamples = [];   // {t, opticalMag} during the opening_motion window
+let imuSamples = [];      // {t, accelMag}
+let imuAvailable = false;
+let imuPermissionGranted = false;
+let openingWindowStart = null;
+let lastMotionDiagLogAt = 0; // v67.10: gates the periodic opening_motion diagnostic samples below
+let eventLog = [];
+
+// v67.5: the two new evidence shots requested alongside the final MRZ-page
+// capture -- see the file-level comment. Both are captured exactly once per
+// attempt (guarded below) and reset on retry.
+let closedCoverImage = null;
+let bothPagesImage = null;
+
+// v67.11: opening-gesture video -- richer human-reviewable evidence than a
+// single still, added specifically BECAUSE the motion-diff proxy proved too
+// weak on its own (see computeFrameMotionMagnitude()'s v67.11 comment). A
+// person watching a few real seconds of the passport actually being opened
+// is far more convincing than any numeric proxy this file could compute.
+// NOTE: unlike the still images, this is NOT included in the payload sent
+// to the live IDV engine (see safe_idv_report_v70.html's callIdvEngine())
+// -- vision APIs take images, not video, so this stays a report-page-only
+// artifact for now.
+const OPENING_GESTURE_VIDEO_BITRATE = 800000; // ~800kbps -- keeps a few seconds small (roughly 300-600KB) without visibly degrading quality for review purposes
+let openingGestureRecorder = null;
+let openingGestureChunks = [];
+let openingGestureVideo = null;
+let openingGestureVideoReadyResolve = null;
+let openingGestureVideoReadyPromise = null;
+
+function pickVideoMimeType() {
+  if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported) return null;
+  // iOS Safari's MediaRecorder support is mp4/h264-first; WebM candidates
+  // included for other browsers this demo might run in.
+  const candidates = ['video/mp4;codecs=avc1', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+  for (const c of candidates) {
+    if (MediaRecorder.isTypeSupported(c)) return c;
+  }
+  return null;
+}
+
+// Starts recording from the SAME videoStream the rest of this file already
+// uses -- no separate capture pipeline needed. Deliberately fails soft: any
+// unsupported browser, missing MediaRecorder, or thrown error just means no
+// video rides along, never a broken capture flow.
+function startOpeningGestureRecording() {
+  openingGestureVideo = null;
+  openingGestureChunks = [];
+  openingGestureVideoReadyPromise = new Promise(resolve => { openingGestureVideoReadyResolve = resolve; });
+  const mimeType = pickVideoMimeType();
+  if (!mimeType || !videoStream) {
+    logEvt('opening_gesture_video_unsupported', {});
+    openingGestureVideoReadyResolve();
+    return;
+  }
+  try {
+    openingGestureRecorder = new MediaRecorder(videoStream, { mimeType, videoBitsPerSecond: OPENING_GESTURE_VIDEO_BITRATE });
+    openingGestureRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) openingGestureChunks.push(e.data); };
+    openingGestureRecorder.start();
+    logEvt('opening_gesture_video_start', { mimeType });
+  } catch (e) {
+    openingGestureRecorder = null;
+    logEvt('opening_gesture_video_error', { message: e.message });
+    openingGestureVideoReadyResolve();
+  }
+}
+
+// MediaRecorder.stop() finalizes its Blob asynchronously (via onstop, after
+// any last ondataavailable) -- openingGestureVideoReadyPromise lets
+// finalizeCapture() wait a bounded amount of time for that instead of
+// racing it (OCR can succeed fast enough that the naive read would often
+// find the video not ready yet).
+function stopOpeningGestureRecording() {
+  const rec = openingGestureRecorder;
+  openingGestureRecorder = null;
+  if (!rec) {
+    if (openingGestureVideoReadyResolve) openingGestureVideoReadyResolve();
+    return;
+  }
+  const mimeType = rec.mimeType || 'video/webm';
+  rec.onstop = () => {
+    if (openingGestureChunks.length) {
+      openingGestureVideo = new Blob(openingGestureChunks, { type: mimeType });
+      logEvt('opening_gesture_video_stop', { bytes: openingGestureVideo.size });
+    }
+    openingGestureChunks = [];
+    if (openingGestureVideoReadyResolve) openingGestureVideoReadyResolve();
+  };
+  try {
+    if (rec.state !== 'inactive') rec.stop();
+    else if (openingGestureVideoReadyResolve) openingGestureVideoReadyResolve();
+  } catch (e) {
+    logEvt('opening_gesture_video_error', { message: e.message });
+    if (openingGestureVideoReadyResolve) openingGestureVideoReadyResolve();
+  }
+}
+
+// v67.8: guide-box transition animation state -- set at the two state
+// transitions below (steady_closed->opening_motion, opening_motion->mrz_ocr)
+// and consumed by drawGuideOverlay()/drawGuideAnim(). null whenever no
+// animation is in flight.
+let guideAnim = null;
+const ANIM_DURATION_MS = 600;
+
+function logEvt(type, data) {
+  eventLog.push({ t: Date.now() - sessionStartMs, type, data: data || null });
+}
+
+// v67.9 FIX: real-device testing (Erik, two separate runs) showed
+// opening_motion stalling for ~70-71 SECONDS before suddenly capturing the
+// instant he returned to the tab after checking a screenshot. Root cause:
+// mobile browsers fully suspend a backgrounded tab's rAF loop -- nothing
+// was "waiting and checking" during that gap, the loop simply didn't run at
+// all. But steadySince/openingWindowStart are compared against the real
+// wall clock (Date.now()), which keeps ticking regardless -- so the first
+// frame after returning could find STEADY_MS_REQUIRED/MIN_OPENING_GESTURE_MS
+// already satisfied purely from elapsed BACKGROUND time, with no live
+// gesture actually observed. Worse, if the camera feed itself also freezes
+// while hidden (plausible -- phones commonly suspend camera capture for
+// backgrounded apps), the first post-return frame's motion diff compares
+// against a stale, identical frame -- reading as perfectly "steady" for
+// free. Both effects point the same direction: a background/foreground
+// round-trip could silently satisfy this file's physical-presence gesture
+// without the gesture happening while actually visible, which defeats the
+// point of the signal, not just looks odd. Fix: on regaining visibility,
+// throw away anything that could have accrued unobserved -- the stale
+// frame baseline and the steady/gesture timers -- so the gate can only be
+// satisfied by a fresh, live gesture. Logged (with the hidden duration) so
+// this is directly confirmable/traceable in the next exported test result,
+// rather than inferred from timestamps after the fact.
+let pageHiddenAt = null;
+function onVisibilityChange() {
+  if (document.hidden) {
+    pageHiddenAt = Date.now();
+    logEvt('visibility_hidden', { state });
+    return;
+  }
+  if (pageHiddenAt === null) return; // became visible without ever having been hidden this session -- nothing to reset
+  const hiddenMs = Date.now() - pageHiddenAt;
+  pageHiddenAt = null;
+  logEvt('visibility_visible', { state, hiddenMs });
+  lastFrameData = null; // next motion reading starts a fresh baseline, not a diff against a stale pre-hide frame
+  steadySince = null;   // any "steady" progress must be re-earned live
+  if (state === 'opening_motion') {
+    openingWindowStart = Date.now(); // the opening gesture must run its full course again, in view
+    motionSamples = [];
+    logEvt('opening_gesture_restarted_after_hidden', { hiddenMs });
+  }
+}
+
+// ══════════════════════════════════════════════════════
+// MRZ PARSING (TD1 / TD2 / TD3, per ICAO Doc 9303)
+// ══════════════════════════════════════════════════════
+// Ported from scratch against the published spec (fixed field positions +
+// weighted check-digit algorithm), not copied from any single source file --
+// same public spec every MRZ reader in the world implements against.
+function mrzCharValue(ch) {
+  if (ch >= '0' && ch <= '9') return ch.charCodeAt(0) - 48;
+  if (ch >= 'A' && ch <= 'Z') return ch.charCodeAt(0) - 55; // A=10 .. Z=35
+  return 0; // '<' and anything unexpected
+}
+function calculateCheckDigit(input) {
+  const weights = [7, 3, 1];
+  let sum = 0;
+  for (let i = 0; i < input.length; i++) {
+    sum += mrzCharValue(input[i]) * weights[i % 3];
+  }
+  return sum % 10;
+}
+function checkDigitOk(field, expectedDigit) {
+  if (expectedDigit === '<' || expectedDigit === '') return null; // not present on this document
+  const expected = parseInt(expectedDigit, 10);
+  if (Number.isNaN(expected)) return false;
+  return calculateCheckDigit(field) === expected;
+}
+function isMRZCandidate(text) {
+  return /^[PIACV][A-Z0-9<]{1}[A-Z]{3}[A-Z0-9<]+$/.test(text);
+}
+function splitName(nameField) {
+  const parts = nameField.split('<<');
+  const surname = (parts[0] || '').replace(/</g, ' ').trim();
+  const given = (parts[1] || '').replace(/</g, ' ').trim();
+  return { surname, given };
+}
+function parseTD3(mrz) {
+  const line1 = mrz.slice(0, 44);
+  const line2 = mrz.slice(44, 88);
+  const { surname, given } = splitName(line1.slice(5).replace(/<+$/,''));
+  const docNumber = line2.slice(0, 9).replace(/<+$/, '');
+  const docNumberCheck = line2[9];
+  const nationality = line2.slice(10, 13);
+  const dob = line2.slice(13, 19);
+  const dobCheck = line2[19];
+  const gender = line2[20];
+  const expiry = line2.slice(21, 27);
+  const expiryCheck = line2[27];
+  const personalNumber = line2.slice(28, 42).replace(/<+$/, '');
+  const personalNumberCheck = line2[42];
+  const compositeCheck = line2[43];
+  const compositeInput = line2.slice(0,10) + line2.slice(13,20) + line2.slice(21,43);
+  return {
+    format: 'TD3', documentTypeCode: line1[0], issuingCountry: line1.slice(2,5),
+    surname, givenNames: given, documentNumber: docNumber, nationality, dateOfBirth: dob,
+    gender, expirationDate: expiry, personalNumber,
+    checks: {
+      documentNumber: checkDigitOk(line2.slice(0,9), docNumberCheck),
+      dateOfBirth: checkDigitOk(dob, dobCheck),
+      expirationDate: checkDigitOk(expiry, expiryCheck),
+      personalNumber: personalNumber ? checkDigitOk(line2.slice(28,42), personalNumberCheck) : null,
+      composite: checkDigitOk(compositeInput, compositeCheck),
+    },
+  };
+}
+function parseTD2(mrz) {
+  const line1 = mrz.slice(0, 36);
+  const line2 = mrz.slice(36, 72);
+  const { surname, given } = splitName(line1.slice(5).replace(/<+$/,''));
+  const docNumber = line2.slice(0, 9).replace(/<+$/, '');
+  const docNumberCheck = line2[9];
+  const nationality = line2.slice(10, 13);
+  const dob = line2.slice(13, 19);
+  const dobCheck = line2[19];
+  const gender = line2[20];
+  const expiry = line2.slice(21, 27);
+  const expiryCheck = line2[27];
+  const optional = line2.slice(28, 35).replace(/<+$/, '');
+  const compositeCheck = line2[35];
+  const compositeInput = line2.slice(0,10) + line2.slice(13,20) + line2.slice(21,35);
+  return {
+    format: 'TD2', documentTypeCode: line1[0], issuingCountry: line1.slice(2,5),
+    surname, givenNames: given, documentNumber: docNumber, nationality, dateOfBirth: dob,
+    gender, expirationDate: expiry, optionalData: optional,
+    checks: {
+      documentNumber: checkDigitOk(line2.slice(0,9), docNumberCheck),
+      dateOfBirth: checkDigitOk(dob, dobCheck),
+      expirationDate: checkDigitOk(expiry, expiryCheck),
+      composite: checkDigitOk(compositeInput, compositeCheck),
+    },
+  };
+}
+function parseTD1(mrz) {
+  const line1 = mrz.slice(0, 30);
+  const line2 = mrz.slice(30, 60);
+  const line3 = mrz.slice(60, 90);
+  const docNumber = line1.slice(5, 14).replace(/<+$/, '');
+  const docNumberCheck = line1[14];
+  const dob = line2.slice(0, 6);
+  const dobCheck = line2[6];
+  const gender = line2[7];
+  const expiry = line2.slice(8, 14);
+  const expiryCheck = line2[14];
+  const nationality = line2.slice(15, 18);
+  const optional = line2.slice(18, 29).replace(/<+$/, '');
+  const compositeCheck = line2[29];
+  const { surname, given } = splitName(line3.replace(/<+$/,''));
+  const compositeInput = line1.slice(5,30) + line2.slice(0,7) + line2.slice(8,15) + line2.slice(18,29);
+  return {
+    format: 'TD1', documentTypeCode: line1[0], issuingCountry: line1.slice(2,5),
+    surname, givenNames: given, documentNumber: docNumber, nationality, dateOfBirth: dob,
+    gender, expirationDate: expiry, optionalData: optional,
+    checks: {
+      documentNumber: checkDigitOk(docNumber, docNumberCheck),
+      dateOfBirth: checkDigitOk(dob, dobCheck),
+      expirationDate: checkDigitOk(expiry, expiryCheck),
+      composite: checkDigitOk(compositeInput, compositeCheck),
+    },
+  };
+}
+function parseMrz(rawText) {
+  // Strip whitespace/newlines the OCR engine may have introduced, keep only
+  // MRZ-legal characters so stray noise doesn't shift the fixed-width slices.
+  const cleaned = rawText.toUpperCase().replace(/[^A-Z0-9<\n]/g, '').replace(/\n+/g, '');
+  if (cleaned.length === 90) return parseTD1(cleaned);
+  if (cleaned.length === 72) return parseTD2(cleaned);
+  if (cleaned.length === 88) return parseTD3(cleaned);
+  return null; // doesn't match any known format length -- treat as a failed read, not a crash
+}
+function mrzResultIsValid(parsed) {
+  if (!parsed) return false;
+  const c = parsed.checks;
+  // Composite is the strongest signal (it covers most of the document), but
+  // require every check that's actually PRESENT on this document (not null)
+  // to pass -- a single silently-failing field check shouldn't be waved
+  // through just because the composite happened to pass.
+  return Object.values(c).every(v => v === null || v === true);
+}
+
+// ══════════════════════════════════════════════════════
+// CAMERA + MOTION
+// ══════════════════════════════════════════════════════
+async function initCamera() {
+  try {
+    videoStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false,
+    });
+  } catch (e) {
+    showBlocked('Camera Unavailable', 'Could not access the camera (' + e.message + '). Passport capture needs camera access to continue.');
+    logEvt('camera_error', { message: e.message });
+    return false;
+  }
+  video.srcObject = videoStream;
+  await new Promise(resolve => { video.onloadedmetadata = resolve; });
+  overlayCanvas.width = video.videoWidth;
+  overlayCanvas.height = video.videoHeight;
+  return true;
+}
+
+function showBlocked(title, body) {
+  document.getElementById('blocked-title').textContent = title;
+  document.getElementById('blocked-body').textContent = body;
+  document.getElementById('blockedOverlay').style.display = 'flex';
+}
+
+// NOT true optical flow (no block-matching/feature-tracking) -- a cheap,
+// honest proxy: downsample each frame to a small grayscale grid and take the
+// mean absolute difference from the previous frame. Real hand-held motion
+// produces a materially higher value than a document held rock-steady (or a
+// static image being re-photographed). Good enough to distinguish "steady"
+// from "deliberate motion" for the open/close gesture; not a substitute for
+// the liveness step's own (more thorough) correlation work.
+const MOTION_SAMPLE_SIZE = 24;
+let motionSampleCanvas = document.createElement('canvas');
+motionSampleCanvas.width = MOTION_SAMPLE_SIZE;
+motionSampleCanvas.height = MOTION_SAMPLE_SIZE;
+let motionSampleCtx = motionSampleCanvas.getContext('2d', { willReadFrequently: true });
+
+// v67.11 FIX: real-device telemetry (v67.10) showed genuine passport-opening
+// motion never registering above ~0.07 smoothed, even over a full MINUTE of
+// visible, deliberate handling -- while an incidental phone jolt (unlocking
+// the screen, pressing a screenshot button) crossed the gate within about a
+// second. Root cause: this diff was computed over the ENTIRE camera frame,
+// most of which is stationary background (couch, table, wall) -- averaged
+// into a 24x24 grid, whatever change a hand-sized object produces gets
+// diluted into near-nothing. Fixed by cropping to the CURRENT guide-box
+// region (passed in by the caller, since it differs by state -- see
+// mainLoop()) before downsampling, so the analysis looks at the area the
+// document actually occupies instead of the whole scene.
+let lastMotionRectKey = null;
+function computeFrameMotionMagnitude(sourceRect) {
+  const sx = sourceRect ? sourceRect.guideX : 0;
+  const sy = sourceRect ? sourceRect.guideY : 0;
+  const sw = sourceRect ? sourceRect.guideW : video.videoWidth;
+  const sh = sourceRect ? sourceRect.guideH : video.videoHeight;
+  // If the source region itself just changed (e.g. steady_closed's
+  // single-page box vs opening_motion's wider spread box), a stale
+  // lastFrameData from the PREVIOUS region would produce a spurious diff
+  // that has nothing to do with real motion -- it'd just be comparing two
+  // differently-cropped images. Treat a region change as a fresh start.
+  const rectKey = sx + '|' + sy + '|' + sw + '|' + sh;
+  if (rectKey !== lastMotionRectKey) {
+    lastMotionRectKey = rectKey;
+    lastFrameData = null;
+  }
+  motionSampleCtx.drawImage(video, sx, sy, sw, sh, 0, 0, MOTION_SAMPLE_SIZE, MOTION_SAMPLE_SIZE);
+  const frame = motionSampleCtx.getImageData(0, 0, MOTION_SAMPLE_SIZE, MOTION_SAMPLE_SIZE).data;
+  if (!lastFrameData) { lastFrameData = frame; return 0; }
+  let diff = 0;
+  for (let i = 0; i < frame.length; i += 4) {
+    // luma approximation, cheap
+    const a = (frame[i] + frame[i+1] + frame[i+2]) / 3;
+    const b = (lastFrameData[i] + lastFrameData[i+1] + lastFrameData[i+2]) / 3;
+    diff += Math.abs(a - b);
+  }
+  lastFrameData = frame;
+  return diff / (MOTION_SAMPLE_SIZE * MOTION_SAMPLE_SIZE) / 255; // normalized 0..~1
+}
+
+// v67.4: raw per-frame magnitude is noisier than expected on real hardware
+// (see MOTION_STEADY_THRESHOLD comment above) -- a single unlucky frame
+// (autofocus hunting, exposure stepping, etc.) could reset the steady timer
+// even while the document itself never moved. Averaging over a short window
+// smooths that out without meaningfully delaying real motion detection.
+// Only used to gate the steady/burst state machine -- the raw per-frame
+// value still feeds the IMU/optical correlation series unchanged, since
+// that comparison already works in resampled time buckets.
+let recentMotionMagnitudes = [];
+function smoothMotion(rawMag) {
+  recentMotionMagnitudes.push(rawMag);
+  if (recentMotionMagnitudes.length > MOTION_SMOOTHING_WINDOW) recentMotionMagnitudes.shift();
+  return recentMotionMagnitudes.reduce((a, b) => a + b, 0) / recentMotionMagnitudes.length;
+}
+
+// v67.8: factored out of opening_motion's inline check so drawGuideOverlay()
+// can use the same "has a real opening burst happened yet" signal to drive
+// the spread guide's amber/green readiness color, not just the state machine.
+function motionSawBurst() {
+  return motionSamples.some(s => s.opticalMag > MOTION_BURST_THRESHOLD);
+}
+
+// v67.8: capture flash -- same technique as the DL flow's fireFlash() (see
+// safe_idv_capture_v70.html), fired at each of the three shutter moments
+// below so it's visually obvious a photo was just taken.
+function fireFlash() {
+  const el = document.getElementById('flash');
+  el.classList.remove('fire');
+  void el.offsetWidth; // force reflow so re-adding 'fire' restarts the CSS animation
+  el.classList.add('fire');
+}
+
+function onDeviceMotion(e) {
+  imuAvailable = true;
+  const acc = e.accelerationIncludingGravity || e.acceleration;
+  if (!acc) return;
+  const mag = Math.sqrt((acc.x||0)**2 + (acc.y||0)**2 + (acc.z||0)**2);
+  imuSamples.push({ t: Date.now(), mag });
+  if (imuSamples.length > 600) imuSamples.shift();
+}
+
+async function requestImuPermission() {
+  try {
+    if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+      const result = await DeviceMotionEvent.requestPermission(); // iOS 13+
+      imuPermissionGranted = (result === 'granted');
+    } else {
+      imuPermissionGranted = true; // Android / older iOS -- no explicit permission gate
+    }
+  } catch (e) {
+    imuPermissionGranted = false;
+  }
+  if (imuPermissionGranted) window.addEventListener('devicemotion', onDeviceMotion);
+}
+
+// Pearson correlation between resampled optical-motion and IMU-motion series
+// over the opening-gesture window -- same idea as the liveness step's
+// IMU/optical correlation, applied here to the document-handling gesture.
+function computeOpeningCorrelation() {
+  if (motionSamples.length < 4 || imuSamples.length < 4 || !openingWindowStart) {
+    return { available: false, reason: !imuAvailable ? 'no_imu' : 'insufficient_samples' };
+  }
+  const windowEnd = Date.now();
+  const imuInWindow = imuSamples.filter(s => s.t >= openingWindowStart && s.t <= windowEnd);
+  if (imuInWindow.length < 4) return { available: false, reason: 'insufficient_imu_samples' };
+
+  // Bucket both series into the same fixed time slices so they can be
+  // correlated point-for-point despite different native sample rates.
+  const bucketMs = 150;
+  const buckets = {};
+  motionSamples.forEach(s => {
+    const b = Math.floor((s.t - openingWindowStart) / bucketMs);
+    buckets[b] = buckets[b] || { optical: [], imu: [] };
+    buckets[b].optical.push(s.opticalMag);
+  });
+  imuInWindow.forEach(s => {
+    const b = Math.floor((s.t - openingWindowStart) / bucketMs);
+    buckets[b] = buckets[b] || { optical: [], imu: [] };
+    buckets[b].imu.push(s.mag);
+  });
+  const opticalSeries = [], imuSeries = [];
+  Object.keys(buckets).sort((a,b)=>a-b).forEach(k => {
+    const b = buckets[k];
+    if (b.optical.length && b.imu.length) {
+      opticalSeries.push(b.optical.reduce((a,c)=>a+c,0)/b.optical.length);
+      imuSeries.push(b.imu.reduce((a,c)=>a+c,0)/b.imu.length);
+    }
+  });
+  if (opticalSeries.length < 3) return { available: false, reason: 'insufficient_aligned_buckets' };
+
+  const n = opticalSeries.length;
+  const meanO = opticalSeries.reduce((a,b)=>a+b,0)/n;
+  const meanI = imuSeries.reduce((a,b)=>a+b,0)/n;
+  let cov = 0, varO = 0, varI = 0;
+  for (let i = 0; i < n; i++) {
+    const dO = opticalSeries[i]-meanO, dI = imuSeries[i]-meanI;
+    cov += dO*dI; varO += dO*dO; varI += dI*dI;
+  }
+  const denom = Math.sqrt(varO*varI);
+  const r = denom > 0 ? cov/denom : 0;
+  return { available: true, pearsonR: r, sampleCount: n };
+}
+
+// ══════════════════════════════════════════════════════
+// TESSERACT SETUP
+// ══════════════════════════════════════════════════════
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src; s.onload = resolve; s.onerror = () => reject(new Error('failed to load ' + src));
+    document.head.appendChild(s);
+  });
+}
+async function initTesseract() {
+  await loadScript(TESSERACT_CDN);
+  // v67.3 FIX: this used to call Tesseract.createWorker() with no language,
+  // then .loadLanguage('mrz')/.initialize('mrz') -- the v2-v4 API. The CDN
+  // bundle this file actually loads is Tesseract.js v5, where loadLanguage
+  // and initialize were made no-ops (confirmed directly against the v5
+  // README/API docs, not assumed) -- the language has to be passed straight
+  // into createWorker(lang, oem, options) instead. Under the old code that
+  // meant the worker likely never loaded ANY language data at all, silently
+  // -- the leading suspect for "still doesn't pick up the passport" on
+  // real-device testing.
+  //
+  // langPath is resolved to an ABSOLUTE URL (this page's own directory)
+  // rather than passed as a bare relative path -- Tesseract.js workers run
+  // in a separate blob: URL context, so a relative langPath can resolve
+  // against the wrong base and silently 404 even when mrz.traineddata.gz is
+  // sitting right next to this HTML file on disk.
+  const pageDir = window.location.href.replace(/\/[^\/]*$/, '');
+  try {
+    tesseractWorker = await Tesseract.createWorker('mrz', 1, {
+      langPath: pageDir,
+      gzip: true,
+      cacheMethod: 'none', // don't let a failed/partial load get cached under the 'mrz' key
+    });
+    usingFallbackModel = false;
+  } catch (e) {
+    // Degrade gracefully rather than fail the whole capture step -- accuracy
+    // will be lower without the OCR-B-trained model, but MRZ's own check
+    // digits still catch most resulting misreads before bad data is used.
+    logEvt('mrz_model_fallback', { reason: e.message });
+    tesseractWorker = await Tesseract.createWorker(TESSERACT_MODEL_FALLBACK);
+    usingFallbackModel = true;
+  }
+  await tesseractWorker.setParameters({
+    tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<',
+  });
+}
+
+// v67.5: this single-page guide box math used to be duplicated inline in
+// getMrzRegionCanvas(), drawGuideOverlay(), and finalizeCapture() -- factored
+// out here so all three (plus the new closed-cover capture) stay in sync.
+// Sized/cropped to just the photo/data page in a landscape framing (ISO/IEC
+// 7810 ID-3 aspect ratio), deliberately NOT wide enough to include the
+// facing page -- see computeSpreadGuideRect() below for that.
+function computeSinglePageGuideRect(w, h) {
+  const guideW = w * 0.86, guideH = guideW / 1.42;
+  const guideX = (w - guideW) / 2, guideY = (h - guideH) / 2;
+  return { guideW, guideH, guideX, guideY };
+}
+
+// v67.6 FIX: v67.5 shipped this as a WIDE/SHORT band (same landscape
+// orientation as the single-page box, just wider) -- backwards from what was
+// actually wanted. Direct correction from Erik: the box should take up most
+// of the phone screen, with the two facing pages stacked TOP and BOTTOM
+// (the applicant naturally rotates the open book so its spine runs
+// horizontally, which fills a portrait phone frame far better than trying
+// to fit a landscape two-page spread edge-to-edge would).
+//
+// v67.8 FIX: v67.6's near-full-screen box (w*0.92, h*0.8) was STILL an
+// independently-guessed pair of numbers, not derived from anything -- which
+// is exactly why the aspect kept looking wrong even after the orientation
+// was fixed. Erik's simpler correction: the spread is just TWO copies of
+// computeSinglePageGuideRect() stacked -- same width, double the height,
+// both centered on screen the same way the single box already is. So this
+// now calls computeSinglePageGuideRect() directly rather than hand-picking
+// new numbers. One useful consequence (see drawSpreadGuide() and the
+// opening/zoom animation in mainLoop()/drawGuideOverlay()): the BOTTOM half
+// of this box is therefore pixel-identical in width/height to the final
+// single-page box -- only its Y position differs -- which is what makes the
+// zoom-in transition onto the photo page a pure slide, not a resize.
+function computeSpreadGuideRect(w, h) {
+  const single = computeSinglePageGuideRect(w, h);
+  const guideW = single.guideW, guideH = single.guideH * 2;
+  const guideX = single.guideX, guideY = (h - guideH) / 2;
+  return { guideW, guideH, guideX, guideY };
+}
+
+function getMrzRegionCanvas() {
+  // MRZ band sits in the bottom ~22% of the guide box -- crop just that
+  // strip out of the current video frame for OCR, rather than the whole
+  // page (faster, and avoids the photo/portrait area confusing the model).
+  const w = video.videoWidth, h = video.videoHeight;
+  const { guideW, guideH, guideX, guideY } = computeSinglePageGuideRect(w, h);
+  const mrzH = guideH * 0.24;
+  const mrzY = guideY + guideH - mrzH;
+  const c = document.createElement('canvas');
+  c.width = guideW * 2; c.height = mrzH * 2; // upscale -- small OCR-B text benefits from it
+  const cctx = c.getContext('2d');
+  cctx.drawImage(video, guideX, mrzY, guideW, mrzH, 0, 0, c.width, c.height);
+  return c;
+}
+
+// v67.5: shared by the closed-cover and both-pages evidence captures --
+// crops the CURRENT video frame to whichever guide rect is passed in and
+// returns a JPEG data URL, same encoding finalizeCapture() already used for
+// the final photo-page shot.
+function captureGuideRegionImage(rect, quality) {
+  const c = document.createElement('canvas');
+  c.width = rect.guideW; c.height = rect.guideH;
+  c.getContext('2d').drawImage(video, rect.guideX, rect.guideY, rect.guideW, rect.guideH, 0, 0, rect.guideW, rect.guideH);
+  return c.toDataURL('image/jpeg', quality != null ? quality : 0.9);
+}
+
+async function attemptMrzOcr() {
+  ocrAttempts++;
+  const region = getMrzRegionCanvas();
+  const { data } = await tesseractWorker.recognize(region);
+  const text = (data && data.text) ? data.text : '';
+  lastOcrRawText = text; // v67.3: surfaced in the debug panel for calibration
+  logEvt('mrz_ocr_attempt', { attempt: ocrAttempts, rawLength: text.replace(/\s/g,'').length });
+  const parsed = parseMrz(text);
+  if (parsed && mrzResultIsValid(parsed)) {
+    return parsed;
+  }
+  if (ocrAttempts >= MAX_OCR_ATTEMPTS_BEFORE_TIP) {
+    document.getElementById('instr-body').textContent =
+      'Having trouble reading the MRZ lines. Try steadier lighting, avoid glare, and keep the bottom of the photo page flat in frame.';
+  }
+  return null;
+}
+
+// ══════════════════════════════════════════════════════
+// STATE MACHINE / UI
+// ══════════════════════════════════════════════════════
+function setDot(id, cls) {
+  const el = document.getElementById(id);
+  el.className = 'dot' + (cls ? ' ' + cls : '');
+}
+function setInstructions(title, body) {
+  document.getElementById('instr-title').textContent = title;
+  document.getElementById('instr-body').textContent = body;
+}
+
+// v67.3: on-screen debug panel -- direct request after real-device testing
+// with no way to see live sensor readings for threshold tuning. #mrzDebug
+// already existed in the markup/CSS from earlier builds but was never
+// wired up to anything; this repurposes it. Off by default, toggled by the
+// DEBUG button in the top bar, and never shown unless tapped -- so it never
+// appears in the applicant-facing flow unless someone deliberately turns it
+// on to share readings back for calibration.
+function toggleDebug() {
+  debugVisible = !debugVisible;
+  document.getElementById('mrzDebug').style.display = debugVisible ? 'block' : 'none';
+  document.getElementById('debugToggle').classList.toggle('active', debugVisible);
+}
+// v67.4: the panel had no way to get its contents OFF the phone -- direct
+// feedback after the debug panel shipped in v67.3 ("no copy button to grab
+// the debug info"). Tapping the panel copies its current text; a short flash
+// window (debugCopyFlashUntil) holds the confirmation message on screen
+// instead of letting the very next animation frame immediately overwrite it.
+let debugCopyFlashUntil = 0;
+let lastDebugText = '';
+async function copyDebugToClipboard() {
+  const el = document.getElementById('mrzDebug');
+  const text = lastDebugText;
+  if (!text) return;
+  try {
+    if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error('Clipboard API unavailable');
+    await navigator.clipboard.writeText(text);
+    el.textContent = '✓ Copied to clipboard';
+  } catch (e) {
+    // Fallback for contexts where the async Clipboard API isn't available
+    // (older WebKit, non-secure context) -- a temporary offscreen textarea +
+    // execCommand('copy') still works in most of those cases.
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      el.textContent = '✓ Copied to clipboard';
+    } catch (e2) {
+      el.textContent = 'Copy failed -- select the text above manually';
+    }
+  }
+  debugCopyFlashUntil = Date.now() + 1200;
+}
+function updateDebugPanel(rawMag, smoothedMag) {
+  if (!debugVisible) return;
+  const now = Date.now();
+  if (now < debugCopyFlashUntil) return; // let the "Copied" confirmation stay visible briefly
+  const stateMs = stateEnteredAt ? (now - stateEnteredAt) : 0;
+  const steadyMs = steadySince !== null ? (now - steadySince) : null;
+  const tessStatus = !tesseractWorker ? 'loading…' : (usingFallbackModel ? 'FALLBACK (eng)' : 'custom (mrz)');
+  const rawPreview = lastOcrRawText ? lastOcrRawText.replace(/\s+/g, ' ').trim().slice(0, 70) : '(none yet)';
+  const lines = [
+    'state=' + state + '  (' + stateMs + 'ms in state)',
+    'motion raw=' + rawMag.toFixed(4) + '  smoothed=' + smoothedMag.toFixed(4) +
+      '  steady<' + MOTION_STEADY_THRESHOLD + '  burst>' + MOTION_BURST_THRESHOLD +
+      (steadyMs !== null ? '  steadyFor=' + steadyMs + 'ms' : '  steadyFor=—'),
+    'imu: available=' + imuAvailable + ' granted=' + imuPermissionGranted + ' samples=' + imuSamples.length,
+    'tesseract=' + tessStatus + '  ocrAttempts=' + ocrAttempts + '  inFlight=' + ocrInFlight,
+    'lastOcrRaw="' + rawPreview + '"',
+  ];
+  lastDebugText = lines.join('\n'); // what actually gets copied -- no UI hint text mixed in
+  document.getElementById('mrzDebug').textContent = lastDebugText + '\n— tap to copy —';
+}
+
+// v67.2: added real positioning aids -- a head/shoulders silhouette where
+// the passport photo goes, ghosted sample MRZ text showing what that band
+// should contain, and an orientation marker -- all requested directly after
+// a real-device test where the guide was just a bare rectangle. These draw
+// from the very first frame (including during prep_countdown), so the
+// applicant has something concrete to line the document up against well
+// before any detection logic starts running.
+function drawHeadSilhouette(ctx, x, y, w, h) {
+  // Simple head+shoulders shape, not a photorealistic outline -- just
+  // enough to communicate "your photo goes here" at a glance.
+  ctx.save();
+  ctx.strokeStyle = 'rgba(232,240,248,0.55)';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([4, 4]);
+  const headCx = x + w / 2, headCy = y + h * 0.36, headR = w * 0.32;
+  ctx.beginPath();
+  ctx.ellipse(headCx, headCy, headR, headR * 1.15, 0, 0, Math.PI * 2);
+  ctx.stroke();
+  // shoulders -- a simple curve from one side to the other, dipping below frame
+  ctx.beginPath();
+  ctx.moveTo(x + w * 0.06, y + h);
+  ctx.quadraticCurveTo(x + w / 2, y + h * 0.62, x + w * 0.94, y + h);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+// v67.7: ghost hint for the closed cover -- direct request to make sure the
+// national emblem and "PASSPORT" title actually end up in frame, not just
+// "some part of a dark cover." Most passport covers place the emblem
+// roughly centered and a "PASSPORT" title beneath it, both reading
+// top-to-bottom in the booklet's natural (portrait) orientation. This guide
+// box is landscape (same convention as the final photo-page box -- see
+// computeSinglePageGuideRect()), so the applicant rotates the closed
+// booklet 90° to fill it, same as they already do for the final MRZ-page
+// shot. Once rotated, that title text reads top-to-bottom along one edge
+// instead of across the middle -- shown here as a vertical ghost label along
+// the left edge, the same "show, don't just tell" idea as the MRZ ghost text
+// on the photo-page guide. If this rotation assumption turns out wrong on
+// real hardware, this is the one place to flip back to a portrait box for
+// this step specifically.
+function drawCoverGhostContent(ctx, x, y, w, h) {
+  ctx.save();
+  ctx.translate(x + w * 0.10, y + h / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillStyle = 'rgba(232,240,248,0.32)';
+  ctx.font = '600 ' + Math.max(11, h * 0.16) + 'px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('PASSPORT', 0, 0);
+  ctx.restore();
+
+  // v67.8: was a plain dashed circle -- direct request to make the emblem
+  // placeholder read more clearly as the eagle seal shown on an actual
+  // passport cover (as depicted in Erik's test photo). See
+  // drawEagleEmblem() below -- still an abstract, low-res placeholder, not
+  // modeled on any specific country's actual emblem artwork.
+  drawEagleEmblem(ctx, x + w / 2, y + h / 2, Math.min(w, h) * 0.16);
+}
+
+// v67.8: low-res, abstract spread-eagle silhouette (head + body + spread
+// wings) standing in for whatever national emblem is actually printed on
+// the cover -- same dashed-placeholder weight/style as the rest of this
+// file's ghost content, not an attempt at any specific country's design.
+function drawEagleEmblem(ctx, cx, cy, r) {
+  ctx.save();
+  ctx.strokeStyle = 'rgba(232,240,248,0.28)';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([3, 4]);
+  // head
+  ctx.beginPath();
+  ctx.arc(cx, cy - r * 0.75, r * 0.18, 0, Math.PI * 2);
+  ctx.stroke();
+  // body
+  ctx.beginPath();
+  ctx.ellipse(cx, cy - r * 0.1, r * 0.22, r * 0.5, 0, 0, Math.PI * 2);
+  ctx.stroke();
+  // wings -- spread and angled slightly upward from the body, the
+  // silhouette common to spread-eagle national emblems generally
+  ctx.beginPath();
+  ctx.moveTo(cx - r * 0.15, cy - r * 0.25);
+  ctx.quadraticCurveTo(cx - r * 0.95, cy - r * 0.55, cx - r, cy + r * 0.1);
+  ctx.quadraticCurveTo(cx - r * 0.55, cy - r * 0.05, cx - r * 0.15, cy + r * 0.1);
+  ctx.closePath();
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(cx + r * 0.15, cy - r * 0.25);
+  ctx.quadraticCurveTo(cx + r * 0.95, cy - r * 0.55, cx + r, cy + r * 0.1);
+  ctx.quadraticCurveTo(cx + r * 0.55, cy - r * 0.05, cx + r * 0.15, cy + r * 0.1);
+  ctx.closePath();
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+// v67.3: closed-cover guide -- direct fix for real-device feedback that the
+// guide showed inside-photo-page content (head silhouette + MRZ ghost text)
+// even while the passport was still closed. This draws during
+// init/prep_countdown/steady_closed instead; drawGuideOverlay() switches to
+// the inside-page guide once opening_motion begins.
+function drawClosedCoverGuide(ctx, x, y, w, h, ready) {
+  drawCoverGhostContent(ctx, x, y, w, h);
+  ctx.save();
+  // v67.8: swap in a readiness confirmation once steadiness has actually
+  // started accumulating -- same amber-until-ready/green-when-locked idea
+  // as the outer box stroke drawn by the caller (drawGuideOverlay()).
+  ctx.fillStyle = ready ? 'rgba(61,184,122,0.85)' : 'rgba(232,240,248,0.55)';
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(ready ? '✓ steady — capturing…' : 'keep the emblem & "PASSPORT" title visible', x + w / 2, y + h - 10);
+  ctx.restore();
+}
+
+// v67.6 FIX: v67.5's version split the box LEFT/RIGHT with a vertical
+// centerline -- wrong axis, per Erik's direct correction. Real usage: the
+// applicant rotates the open book so its spine runs horizontally, stacking
+// the two facing pages TOP and BOTTOM within the (now near-full-screen,
+// portrait-ish) box from computeSpreadGuideRect(). Horizontal divider now,
+// plus corner brackets on each half so there's an actual per-page framing
+// hint ("guidelines and markings"), not just a bare box. Both halves get
+// identical, generic brackets -- this build has no way to know in advance
+// which physical half will land on the photo/MRZ page vs. the facing page,
+// so it doesn't guess; the precise, content-aware guide (head silhouette +
+// MRZ band) still only ever appears on the single-page box once the
+// applicant lands back on the photo page.
+// v67.8: added `ready` (amber/green readiness color -- see caller in
+// drawGuideOverlay()) and biased the ghost content toward the BOTTOM half
+// specifically. Both halves used to get identical, generic brackets because
+// this build had no way to know in advance which half would land on the
+// photo/MRZ page -- that's no longer true: since computeSpreadGuideRect()
+// now derives this box as exactly two stacked copies of the single-page
+// box, and the opening-transition animation swings open from the bottom
+// (US passport spine, per Erik's confirmation), the bottom half is known to
+// be where the applicant re-frames onto next. Hinted with a lighter version
+// of the same head-silhouette/MRZ-band cues used on the single-page guide,
+// not the full-strength versions (this is still a coarse "roughly here"
+// hint at this zoomed-out framing, not the precise final crop).
+function drawSpreadGuide(ctx, x, y, w, h, ready) {
+  const half = h / 2;
+  const dividerY = y + half;
+
+  ctx.save();
+  ctx.strokeStyle = 'rgba(232,240,248,0.35)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 5]);
+  ctx.beginPath();
+  ctx.moveTo(x, dividerY);
+  ctx.lineTo(x + w, dividerY);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+
+  const bracket = Math.min(26, w * 0.07);
+  [y, y + half].forEach((topY) => {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(232,240,248,0.4)';
+    ctx.lineWidth = 2;
+    // top-left corner of this half
+    ctx.beginPath();
+    ctx.moveTo(x, topY + bracket);
+    ctx.lineTo(x, topY);
+    ctx.lineTo(x + bracket, topY);
+    ctx.stroke();
+    // top-right corner of this half
+    ctx.beginPath();
+    ctx.moveTo(x + w - bracket, topY);
+    ctx.lineTo(x + w, topY);
+    ctx.lineTo(x + w, topY + bracket);
+    ctx.stroke();
+    ctx.restore();
+  });
+
+  // v67.8: bottom-half-specific hint -- lighter-weight versions of the
+  // single-page guide's own head-silhouette and MRZ-band cues, positioned
+  // the same way they'll appear once the applicant lands on the tight
+  // single-page box (see the 'zoom' animation in drawGuideAnim(), which
+  // slides exactly this region up into that box).
+  const hintPhotoW = w * 0.20, hintPhotoH = half * 0.5;
+  const hintPhotoX = x + w * 0.06, hintPhotoY = y + half + half * 0.12;
+  ctx.save();
+  ctx.globalAlpha = 0.55;
+  drawHeadSilhouette(ctx, hintPhotoX, hintPhotoY, hintPhotoW, hintPhotoH);
+  ctx.restore();
+  const hintMrzH = half * 0.16;
+  const hintMrzY = y + h - hintMrzH - half * 0.06;
+  ctx.save();
+  ctx.globalAlpha = 0.55;
+  drawMrzGhostText(ctx, x + w * 0.04, hintMrzY, w * 0.92, hintMrzH);
+  ctx.restore();
+
+  ctx.save();
+  ctx.fillStyle = ready ? 'rgba(61,184,122,0.85)' : 'rgba(232,240,248,0.65)';
+  ctx.font = '600 14px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(ready ? 'HOLD — CAPTURING' : 'OPEN — FIT BOTH PAGES IN FRAME', x + w / 2, y - 12);
+  ctx.font = '11px sans-serif';
+  ctx.fillStyle = 'rgba(232,240,248,0.42)';
+  // v67.8: explicitly calls out that fingers holding the book open near the
+  // edges are expected and fine -- direct answer to Erik's finger/border
+  // obstruction question. No attempt to detect or reject obstruction, same
+  // "don't build what you can't honestly measure" approach as the rest of
+  // this file.
+  ctx.fillText("fingers holding the pages open near the edges are fine", x + w / 2, y + h + 20);
+  ctx.restore();
+}
+
+function drawMrzGhostText(ctx, x, y, w, h) {
+  // Sample MRZ-shaped text (not real document data) ghosted into the band,
+  // so the applicant can see what kind of content is expected there before
+  // OCR ever runs -- purely a positioning aid.
+  ctx.save();
+  ctx.fillStyle = 'rgba(61,184,122,0.35)';
+  const fontSize = Math.max(10, h * 0.32);
+  ctx.font = fontSize + 'px monospace';
+  ctx.textBaseline = 'middle';
+  const line1 = 'P<UTOSURNAME<<GIVENNAMES<<<<<<<<<<<<<<<<<<<<';
+  const line2 = 'L898902C36UTO7408122F1204159ZE184226B<<<<<10';
+  ctx.fillText(line1.slice(0, Math.floor(w / (fontSize*0.62))), x, y + h * 0.32);
+  ctx.fillText(line2.slice(0, Math.floor(w / (fontSize*0.62))), x, y + h * 0.72);
+  ctx.restore();
+}
+
+// v67.8: draws the in-progress guide-box transition (see guideAnim/
+// ANIM_DURATION_MS above, set at the two state-change points in mainLoop()).
+// 'opening' morphs the closed single-page box into the spread box, biased to
+// swing open from the BOTTOM edge -- the US passport's bound edge, per
+// Erik's confirmation that the spine sits at the bottom of this file's
+// established rotated orientation -- so the top edge moves first/faster and
+// the bottom edge follows and settles later. 'zoom' slides the spread's
+// bottom half up into the final single-page box; a pure slide rather than a
+// resize because computeSpreadGuideRect() now derives that half as exactly
+// the same width/height as the single-page box. Neither crossfades the
+// inner ghost content (head silhouette, MRZ band, cover emblem) -- that's a
+// straight cut once the animation completes, kept simple deliberately
+// rather than risking a half-rendered mix of two different guides' content
+// mid-morph. This is a geometry interpolation, not a physical hinge/
+// perspective simulation -- an "honest proxy" animation, same spirit as
+// this file's motion-diff proxy elsewhere.
+function drawGuideAnim(anim, t) {
+  const { type, fromRect, toRect } = anim;
+  if (type === 'opening') {
+    const topY = lerp(fromRect.guideY, toRect.guideY, easeOutCubic(t));
+    const fromBottom = fromRect.guideY + fromRect.guideH;
+    const toBottom = toRect.guideY + toRect.guideH;
+    const botY = lerp(fromBottom, toBottom, easeInCubic(t));
+    const x = fromRect.guideX, boxW = fromRect.guideW; // width is identical in both rects
+    overlayCtx.strokeStyle = '#E8A020';
+    overlayCtx.lineWidth = 3;
+    overlayCtx.strokeRect(x, topY, boxW, botY - topY);
+    // Divider only appears once the box is mostly open -- a simple
+    // threshold reveal rather than a continuous crossfade.
+    if (t > 0.5) {
+      const revealT = (t - 0.5) / 0.5;
+      overlayCtx.save();
+      overlayCtx.globalAlpha = revealT;
+      overlayCtx.strokeStyle = 'rgba(232,240,248,0.35)';
+      overlayCtx.lineWidth = 1;
+      overlayCtx.setLineDash([4, 5]);
+      const midY = topY + (botY - topY) / 2;
+      overlayCtx.beginPath();
+      overlayCtx.moveTo(x, midY);
+      overlayCtx.lineTo(x + boxW, midY);
+      overlayCtx.stroke();
+      overlayCtx.setLineDash([]);
+      overlayCtx.restore();
+    }
+  } else if (type === 'zoom') {
+    const y = lerp(fromRect.guideY, toRect.guideY, easeInOutCubic(t));
+    overlayCtx.strokeStyle = '#3DB87A';
+    overlayCtx.lineWidth = 3;
+    overlayCtx.strokeRect(fromRect.guideX, y, fromRect.guideW, fromRect.guideH);
+  }
+}
+function lerp(a, b, t) { return a + (b - a) * t; }
+function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
+function easeInCubic(t) { return t * t * t; }
+function easeInOutCubic(t) { return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; }
+
+function drawGuideOverlay() {
+  const w = overlayCanvas.width, h = overlayCanvas.height;
+  overlayCtx.clearRect(0, 0, w, h);
+
+  // v67.8: guide-box transition animation, if one is in flight -- see
+  // drawGuideAnim() above and mainLoop()'s state-change handlers for where
+  // guideAnim gets set. Drawn INSTEAD of the normal per-state guide below
+  // for its short duration, then cleared so normal rendering resumes.
+  if (guideAnim) {
+    const elapsed = Date.now() - guideAnim.startedAt;
+    if (elapsed >= ANIM_DURATION_MS) {
+      guideAnim = null;
+    } else {
+      drawGuideAnim(guideAnim, elapsed / ANIM_DURATION_MS);
+      return;
+    }
+  }
+
+  // v67.5: opening_motion now gets its OWN, much wider guide box (see
+  // computeSpreadGuideRect()) so the applicant can frame both facing pages
+  // for the new "both pages" evidence capture -- handled as a fully separate
+  // branch rather than a wider version of the box below, since none of the
+  // single-page guide's contents (head silhouette, MRZ band/ghost) make
+  // sense at this zoomed-out framing.
+  if (state === 'opening_motion') {
+    const spread = computeSpreadGuideRect(w, h);
+    // v67.8: amber-until-ready / green-when-locked readiness color, mirroring
+    // the DL flow's detected/locked pattern (safe_idv_capture_v70.html) --
+    // there's no real document-edge detection here, so this reuses the
+    // existing "saw a real opening burst, now holding steady" signal that
+    // already gates the state-machine transition further below.
+    const spreadReady = motionSawBurst() && steadySince !== null;
+    overlayCtx.strokeStyle = spreadReady ? '#3DB87A' : '#E8A020';
+    overlayCtx.lineWidth = 3;
+    overlayCtx.setLineDash(spreadReady ? [] : [6, 5]);
+    overlayCtx.strokeRect(spread.guideX, spread.guideY, spread.guideW, spread.guideH);
+    overlayCtx.setLineDash([]);
+    drawSpreadGuide(overlayCtx, spread.guideX, spread.guideY, spread.guideW, spread.guideH, spreadReady);
+    return;
+  }
+
+  const { guideW, guideH, guideX, guideY } = computeSinglePageGuideRect(w, h);
+  const mrzH = guideH * 0.24;
+  // v67.3: the guide depends on whether the passport should still be CLOSED
+  // at this point in the flow. v67.5: opening_motion no longer reaches this
+  // branch at all (see above), so this only ever needs to distinguish
+  // "closed cover" (init/prep_countdown/steady_closed) from "back on the
+  // photo page" (mrz_ocr/complete).
+  const showInsidePageGuide = (state === 'mrz_ocr' || state === 'complete');
+  // v67.8: same amber/green readiness treatment as the spread guide above,
+  // driven by this state's own steadiness signal (the same one whose
+  // threshold-crossing triggers the closed-cover capture in mainLoop()).
+  const closedReady = (state === 'steady_closed' && steadySince !== null);
+  const locked = showInsidePageGuide || closedReady;
+
+  overlayCtx.strokeStyle = locked ? '#3DB87A' : '#E8A020';
+  overlayCtx.lineWidth = 3;
+  overlayCtx.setLineDash(locked ? [] : [6, 5]);
+  overlayCtx.strokeRect(guideX, guideY, guideW, guideH);
+  overlayCtx.setLineDash([]);
+
+  // Orientation marker: a filled corner bracket at top-left, plus a label --
+  // a bare rectangle doesn't communicate "this way up" on its own. Label
+  // text differs for the closed cover vs. the open photo page.
+  overlayCtx.save();
+  overlayCtx.strokeStyle = '#E8A020';
+  overlayCtx.lineWidth = 4;
+  const bracket = Math.min(28, guideW * 0.06);
+  overlayCtx.beginPath();
+  overlayCtx.moveTo(guideX, guideY + bracket);
+  overlayCtx.lineTo(guideX, guideY);
+  overlayCtx.lineTo(guideX + bracket, guideY);
+  overlayCtx.stroke();
+  overlayCtx.restore();
+  overlayCtx.save();
+  overlayCtx.fillStyle = 'rgba(232,240,248,0.75)';
+  overlayCtx.font = '600 13px sans-serif';
+  overlayCtx.textAlign = 'center';
+  overlayCtx.fillText(showInsidePageGuide ? 'PHOTO PAGE — THIS SIDE UP' : 'COVER — THIS SIDE UP', guideX + guideW / 2, guideY - 10);
+  overlayCtx.restore();
+
+  if (showInsidePageGuide) {
+    // Head/shoulders silhouette in the photo area -- passport photo pages
+    // put the portrait in a roughly fixed position in the upper portion of
+    // the page, left-aligned on most layouts.
+    const photoW = guideW * 0.32, photoH = guideH * 0.6;
+    const photoX = guideX + guideW * 0.05, photoY = guideY + guideH * 0.08;
+    drawHeadSilhouette(overlayCtx, photoX, photoY, photoW, photoH);
+
+    // MRZ band -- outlined faintly so its location is visible as soon as the
+    // inside-page guide appears, not just once OCR is actually running.
+    const mrzY = guideY + guideH - mrzH;
+    overlayCtx.strokeStyle = (state === 'mrz_ocr' || state === 'complete') ? 'rgba(61,184,122,0.9)' : 'rgba(61,184,122,0.4)';
+    overlayCtx.lineWidth = 2;
+    overlayCtx.strokeRect(guideX, mrzY, guideW, mrzH);
+    if (state !== 'mrz_ocr' && state !== 'complete') {
+      drawMrzGhostText(overlayCtx, guideX + guideW * 0.02, mrzY, guideW * 0.96, mrzH);
+    }
+  } else {
+    drawClosedCoverGuide(overlayCtx, guideX, guideY, guideW, guideH, closedReady);
+  }
+}
+
+let mainLoopHandle = null;
+function mainLoop() {
+  drawGuideOverlay();
+  // v67.11: crop the motion analysis to whatever guide box is showing for
+  // the CURRENT state, rather than the whole frame -- see
+  // computeFrameMotionMagnitude()'s comment for why this matters.
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const motionRect = (state === 'opening_motion') ? computeSpreadGuideRect(vw, vh) : computeSinglePageGuideRect(vw, vh);
+  const rawMag = computeFrameMotionMagnitude(motionRect);
+  const mag = smoothMotion(rawMag); // v67.4: smoothed value drives the state machine below
+  const now = Date.now();
+  updateDebugPanel(rawMag, mag);
+
+  if (state === 'prep_countdown') {
+    // v67.2: fixed lead-in, added directly in response to real-device
+    // testing where the flow raced past this step before the applicant
+    // could react. Guide graphics are already visible (drawGuideOverlay ran
+    // above) so positioning can start immediately; nothing is measured yet.
+    const remainingMs = PREP_COUNTDOWN_MS - (now - prepCountdownStartedAt);
+    if (remainingMs <= 0) {
+      state = 'steady_closed';
+      stateEnteredAt = now;
+      steadySince = null;
+      setInstructions('Show your passport closed', 'Hold it steady, cover facing the camera, with the emblem and "PASSPORT" title visible.');
+      logEvt('state_change', { to: state });
+    } else {
+      document.getElementById('instr-title').textContent = 'Get ready — ' + Math.ceil(remainingMs / 1000) + '…';
+    }
+  } else if (state === 'steady_closed') {
+    if (mag < MOTION_STEADY_THRESHOLD) {
+      if (steadySince === null) steadySince = now;
+    } else {
+      steadySince = null;
+    }
+    if (steadySince !== null && (now - steadySince) >= STEADY_MS_REQUIRED) {
+      const vw = video.videoWidth, vh = video.videoHeight;
+      state = 'opening_motion';
+      stateEnteredAt = now;
+      openingWindowStart = now;
+      motionSamples = [];
+      steadySince = null;
+      // v67.5: this is the sharpest, most stable frame we'll ever get of the
+      // closed cover -- steadiness was JUST confirmed, so grab it now rather
+      // than at some arbitrary later point.
+      closedCoverImage = captureGuideRegionImage(computeSinglePageGuideRect(vw, vh));
+      fireFlash(); // v67.8: shutter cue at the actual capture instant
+      logEvt('closed_cover_captured', {});
+      // v67.11: start recording the opening gesture itself -- see the
+      // file-level comment above openingGestureRecorder for why (the
+      // motion-diff proxy alone proved too weak as evidence on its own).
+      startOpeningGestureRecording();
+      // v67.8: guide-box opening animation -- morphs from the closed
+      // single-page box into the spread box, hinging open from the bottom
+      // (see drawGuideAnim()'s comment for why).
+      guideAnim = { type: 'opening', startedAt: now,
+        fromRect: computeSinglePageGuideRect(vw, vh), toRect: computeSpreadGuideRect(vw, vh) };
+      setDot('dot-closed', 'done'); setDot('dot-open', 'active');
+      setInstructions('Now open it', 'Open your passport to the photo page and hold it flat, facing the camera. Fingers near the edges holding it open are fine.');
+      logEvt('state_change', { to: state });
+    }
+  } else if (state === 'opening_motion') {
+    motionSamples.push({ t: now, opticalMag: mag });
+    if (mag > MOTION_BURST_THRESHOLD) {
+      steadySince = null; // saw real motion -- now wait for it to settle again
+    } else if (steadySince === null) {
+      steadySince = now;
+    }
+    // Require the burst to have actually happened at least once, THEN settle
+    // for STEADY_MS_REQUIRED, AND the whole gesture to have taken at least
+    // MIN_OPENING_GESTURE_MS -- that last guard is what actually fixes the
+    // "raced past it" bug: even a very fast, jittery motion reading can't
+    // complete this step in under ~1.8s of real time.
+    const sawBurst = motionSawBurst();
+    const steadyLongEnough = steadySince !== null && (now - steadySince) >= STEADY_MS_REQUIRED;
+    const gestureOldEnough = (now - openingWindowStart) >= MIN_OPENING_GESTURE_MS;
+    // v67.11: cropping the motion analysis to the guide box (see
+    // computeFrameMotionMagnitude()) should make sawBurst actually fire for
+    // a real opening gesture now -- but we don't have real-device proof of
+    // that YET, and the last thing anyone needs is a repeat of the
+    // 70-127-second stalls. This is a deliberate safety net, not the
+    // primary path: if a burst still hasn't registered after a much longer
+    // wait, but the scene has genuinely been steady for the required
+    // duration anyway, let it through rather than risk another indefinite
+    // stall. Logged distinctly (see opening_gesture_fallback_used below) so
+    // it's obvious on the next real test whether the crop fix is actually
+    // doing the work, or whether this fallback is quietly covering for it.
+    const fallbackWaitElapsed = (now - openingWindowStart) >= MAX_OPENING_WAIT_MS;
+    const readyViaBurst = sawBurst && steadyLongEnough && gestureOldEnough;
+    const readyViaFallback = !readyViaBurst && fallbackWaitElapsed && steadyLongEnough;
+
+    // v67.10: periodic diagnostic sample -- direct response to two stalls
+    // (70s, then 127s) that LOOKED identical from the outside (visibly
+    // open, visibly steady, still not capturing) but that we had no actual
+    // motion data for, forcing us to guess at the cause. This makes the
+    // real trace show up in the next exported eventLog instead.
+    if (now - lastMotionDiagLogAt >= MOTION_DIAG_LOG_INTERVAL_MS) {
+      lastMotionDiagLogAt = now;
+      logEvt('opening_motion_diag', {
+        rawMag: Math.round(rawMag * 10000) / 10000,
+        smoothedMag: Math.round(mag * 10000) / 10000,
+        sawBurst, steadyLongEnough, gestureOldEnough, fallbackWaitElapsed,
+        steadyForMs: steadySince !== null ? (now - steadySince) : null,
+        gestureAgeMs: now - openingWindowStart,
+      });
+    }
+
+    if (readyViaBurst || readyViaFallback) {
+      if (readyViaFallback) logEvt('opening_gesture_fallback_used', { gestureAgeMs: now - openingWindowStart });
+      stopOpeningGestureRecording(); // v67.11: clip ends exactly when the gesture is confirmed done
+      const vw = video.videoWidth, vh = video.videoHeight;
+      // v67.8 FIX: this used to be a fixed timer (half of
+      // MIN_OPENING_GESTURE_MS into the window), which fired before a slow
+      // or hesitant real-world open finished -- confirmed directly from
+      // Erik's test screenshot, where the "both pages" shot showed the
+      // document in the SAME closed orientation as the cover shot. Now
+      // captured HERE, at the exact instant this transition's own "the
+      // gesture is actually done" signal fires -- reusing the state
+      // machine's own confirmation instead of an independent guess.
+      bothPagesImage = captureGuideRegionImage(computeSpreadGuideRect(vw, vh));
+      fireFlash(); // v67.8: shutter cue at the actual capture instant
+      logEvt('both_pages_captured', {});
+      // v67.8: zoom-in animation -- slides the spread's bottom half (where
+      // the photo/MRZ page is now known to land, per the bottom-hinge
+      // opening animation) up into the tight final single-page box. A pure
+      // slide, not a resize -- see computeSpreadGuideRect()'s comment.
+      const spread = computeSpreadGuideRect(vw, vh);
+      const bottomHalfRect = { guideX: spread.guideX, guideY: spread.guideY + spread.guideH / 2,
+        guideW: spread.guideW, guideH: spread.guideH / 2 };
+      guideAnim = { type: 'zoom', startedAt: now,
+        fromRect: bottomHalfRect, toRect: computeSinglePageGuideRect(vw, vh) };
+      setDot('dot-open', 'done'); setDot('dot-mrz', 'active');
+      setInstructions('Reading passport…', 'Keep the photo page steady and in frame.');
+      logEvt('state_change', { to: 'mrz_ocr', correlation: computeOpeningCorrelation() });
+      state = 'mrz_ocr';
+      stateEnteredAt = now;
+      lastOcrAttemptAt = 0;
+    } else if (now - openingWindowStart > 15000 && !sawBurst) {
+      // Nobody's required to move in any particular way, but if 15s pass
+      // with zero motion at all, the applicant is probably confused about
+      // what to do -- nudge rather than silently wait forever.
+      setInstructions('Open your passport', 'Move it slightly as you open it to the photo page — we\'re just confirming it\'s being handled, not photographed flat.');
+    }
+  } else if (state === 'mrz_ocr') {
+    if (!tesseractWorker) {
+      // still initializing in the background -- keep looping
+    } else if (now - lastOcrAttemptAt > MRZ_OCR_INTERVAL_MS && !ocrInFlight) {
+      lastOcrAttemptAt = now;
+      ocrInFlight = true;
+      attemptMrzOcr().then(parsed => {
+        ocrInFlight = false;
+        if (parsed) {
+          state = 'complete';
+          stateEnteredAt = Date.now();
+          setDot('dot-mrz', 'done');
+          finalizeCapture(parsed);
+        }
+      }).catch(e => {
+        ocrInFlight = false;
+        logEvt('mrz_ocr_error', { message: e.message });
+      });
+    }
+  }
+
+  if (state !== 'complete') {
+    mainLoopHandle = requestAnimationFrame(mainLoop);
+  }
+}
+let lastOcrAttemptAt = 0;
+let ocrInFlight = false;
+
+async function finalizeCapture(mrzParsed) {
+  setInstructions('Passport captured', 'Processing…');
+  const frontImage = captureGuideRegionImage(computeSinglePageGuideRect(video.videoWidth, video.videoHeight));
+  fireFlash(); // v67.8: shutter cue for the third and final capture
+  // v67.11: MediaRecorder.stop() (called back in the opening_motion branch)
+  // finalizes its Blob asynchronously -- OCR can succeed fast enough that
+  // it hasn't resolved yet by the time we get here. Wait for it, bounded by
+  // a short timeout so a slow/stuck finalize can never hang the flow --
+  // worse case is just no video that one time, same as unsupported browsers.
+  if (openingGestureVideoReadyPromise) {
+    await Promise.race([openingGestureVideoReadyPromise, new Promise(resolve => setTimeout(resolve, 2000))]);
+  }
+  // Defensive fallback -- v67.8: bothPagesImage is now captured at the same
+  // state-transition signal that leads here (see the opening_motion branch
+  // in mainLoop()), so by construction it should always already be set by
+  // this point. Kept as a fallback anyway, rather than silently sending a
+  // null image, in case some future edge case slips through.
+  if (!bothPagesImage) {
+    bothPagesImage = captureGuideRegionImage(computeSpreadGuideRect(video.videoWidth, video.videoHeight));
+    logEvt('both_pages_captured_fallback', {});
+  }
+
+  const correlation = computeOpeningCorrelation();
+  const captureSignals = {
+    docType: 'passport',
+    mrzFormat: mrzParsed.format,
+    mrzOcrModel: usingFallbackModel ? 'tesseract_fallback_eng' : 'tesseract_custom_ocrb',
+    ocrAttempts,
+    openCloseGesture: {
+      correlation,
+      motionSampleCount: motionSamples.length,
+      imuAvailable, imuPermissionGranted,
+    },
+    eventCount: eventLog.length,
+    events: eventLog,
+    sessionStartMs, sessionEndMs: Date.now(), durationMs: Date.now() - sessionStartMs,
+  };
+
+  if (videoStream) videoStream.getTracks().forEach(t => t.stop());
+  window.removeEventListener('devicemotion', onDeviceMotion);
+  document.removeEventListener('visibilitychange', onVisibilityChange);
+
+  // v67.5: frontImage stays the required/canonical field (same key the
+  // report page already checks for "did capture complete" -- see
+  // safe_idv_launch_v70.html's continueToReport()) -- closedCoverImage,
+  // bothPagesImage, and (v67.11) openingGestureVideo ride along as
+  // additional evidence. openingGestureVideo is a Blob (or null) --
+  // postMessage's structured-clone transfer handles Blobs directly, no
+  // base64 encoding needed the way the stills require.
+  const payload = {
+    type: 'safeAutocaptureComplete',
+    images: { frontImage, closedCoverImage, bothPagesImage, openingGestureVideo },
+    captureSignals,
+    mrz: mrzParsed,
+  };
+  window.parent.postMessage(payload, '*');
+  if (isStandalone) showStandaloneResults(payload);
+}
+
+// v67.5: renders exactly the payload that would otherwise be posted to a
+// parent page -- direct answer to "is there a way to test this without the
+// liveness step ahead of it." window.parent.postMessage() above still fires
+// even when standalone (harmless -- it goes nowhere when there's no parent
+// listening), so this is purely additive, not a forked code path.
+function standaloneImageFigure(label, dataUrl) {
+  if (!dataUrl) return `<div class="empty">${esc(label)}<br>not captured</div>`;
+  return `<figure><img src="${dataUrl}" alt="${esc(label)}"><figcaption>${esc(label)}</figcaption></figure>`;
+}
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+// v67.11: video needs an object URL rather than a data URL (unlike the
+// stills, which are already base64 strings from toDataURL()) -- built from
+// the Blob directly, no encoding step needed.
+// v67.12: a bare inline <video> here was triggering iOS Safari's native
+// fullscreen player on tap, with no way back to this page (Erik: "it just
+// opened a video player and there was nowhere to navigate to"). Now this
+// renders a clickable poster thumbnail (reusing bothPagesImage, captured
+// ~300ms before the clip ends, as a representative frame) styled like the
+// other figures; the actual <video> only ever lives inside the bounded
+// #videoModal, opened on demand via openVideoModal() and dismissed with its
+// own Close button (see openVideoModal()/closeVideoModal() below).
+let standaloneVideoObjectUrl = null;
+function standaloneVideoFigure(label, blob, posterDataUrl) {
+  if (!blob) return `<div class="empty">${esc(label)}<br>not captured</div>`;
+  standaloneVideoObjectUrl = URL.createObjectURL(blob);
+  return `<figure><div class="video-thumb" onclick="openVideoModal(standaloneVideoObjectUrl)">` +
+    (posterDataUrl ? `<img src="${posterDataUrl}" alt="${esc(label)}">` : '') +
+    `<div class="play-badge"></div></div><figcaption>${esc(label)} (${Math.round(blob.size/1024)}KB) &middot; tap to play</figcaption></figure>`;
+}
+// v67.13: no native `controls` on #videoModalPlayer anymore (see the CSS
+// comment above #videoModal) -- toggleVideoModalPlayback() drives a small
+// custom play/pause overlay instead, and onVideoModalFullscreenAttempt()
+// is a defensive backstop that bounces back out if iOS ever tries to take
+// the video fullscreen through some other path (e.g. a long-press gesture
+// rather than a controls-bar tap). Wired once via videoModalListenersReady
+// rather than in openVideoModal() so repeated opens don't stack listeners.
+let videoModalListenersReady = false;
+function ensureVideoModalListeners(player) {
+  if (videoModalListenersReady) return;
+  videoModalListenersReady = true;
+  const toggle = document.getElementById('videoModalToggle');
+  const setIcon = () => { toggle.textContent = player.paused ? '▶' : '⏸'; };
+  player.addEventListener('play', setIcon);
+  player.addEventListener('pause', setIcon);
+  player.addEventListener('ended', setIcon);
+  player.addEventListener('webkitbeginfullscreen', onVideoModalFullscreenAttempt);
+}
+function onVideoModalFullscreenAttempt() {
+  const player = document.getElementById('videoModalPlayer');
+  if (typeof player.webkitExitFullscreen === 'function') player.webkitExitFullscreen();
+}
+function toggleVideoModalPlayback() {
+  const player = document.getElementById('videoModalPlayer');
+  if (player.paused) player.play().catch(() => {});
+  else player.pause();
+}
+function openVideoModal(url) {
+  if (!url) return;
+  const player = document.getElementById('videoModalPlayer');
+  ensureVideoModalListeners(player);
+  player.src = url;
+  document.getElementById('videoModal').style.display = 'flex';
+  document.getElementById('videoModalToggle').textContent = '⏸';
+  player.play().catch(() => {});
+}
+function closeVideoModal() {
+  const player = document.getElementById('videoModalPlayer');
+  player.pause();
+  document.getElementById('videoModal').style.display = 'none';
+  player.removeAttribute('src');
+  player.load();
+}
+function showStandaloneResults(payload) {
+  document.getElementById('standaloneImages').innerHTML =
+    standaloneImageFigure('Closed Cover', payload.images.closedCoverImage) +
+    standaloneImageFigure('Both Pages (Open)', payload.images.bothPagesImage) +
+    standaloneImageFigure('Photo Page (MRZ)', payload.images.frontImage) +
+    standaloneVideoFigure('Opening Gesture (Video)', payload.images.openingGestureVideo, payload.images.bothPagesImage);
+  document.getElementById('standaloneJson').textContent =
+    JSON.stringify({ mrz: payload.mrz, captureSignals: payload.captureSignals }, null, 2);
+  document.getElementById('standaloneResults').style.display = 'block';
+}
+
+function retryFromTop() {
+  document.getElementById('retryBtn').style.display = 'none';
+  ocrAttempts = 0;
+  steadySince = null;
+  closedCoverImage = null;
+  bothPagesImage = null;
+  guideAnim = null; // v67.8: clear any in-flight transition animation on retry
+  lastMotionDiagLogAt = 0; // v67.10: let the next opening_motion window log its first sample immediately
+  // v67.11: a retry mid-opening_motion would otherwise leave a MediaRecorder
+  // running against a videoStream that's about to be reused for a fresh
+  // attempt. Stop and discard it directly (not via stopOpeningGestureRecording(),
+  // whose onstop would otherwise asynchronously overwrite the openingGestureVideo
+  // reset below with this discarded attempt's data after the fact).
+  if (openingGestureRecorder) {
+    const discardedRec = openingGestureRecorder;
+    openingGestureRecorder = null;
+    discardedRec.ondataavailable = null;
+    discardedRec.onstop = null;
+    try { if (discardedRec.state !== 'inactive') discardedRec.stop(); } catch (e) { /* already stopped/inactive -- nothing to clean up */ }
+  }
+  openingGestureVideo = null;
+  openingGestureChunks = [];
+  if (openingGestureVideoReadyResolve) { openingGestureVideoReadyResolve(); openingGestureVideoReadyResolve = null; }
+  openingGestureVideoReadyPromise = null;
+  setDot('dot-closed', ''); setDot('dot-open', ''); setDot('dot-mrz', '');
+  // v67.2: retry re-enters the prep countdown too, not straight into
+  // steady_closed -- same reasoning as the initial boot, a retry deserves
+  // the same grace period to reposition rather than assuming the applicant
+  // is already holding the document correctly the instant they tap Retry.
+  prepCountdownStartedAt = Date.now();
+  state = 'prep_countdown';
+  stateEnteredAt = Date.now();
+  logEvt('state_change', { to: state, reason: 'retry' });
+}
+
+// ══════════════════════════════════════════════════════
+// BOOT
+// ══════════════════════════════════════════════════════
+async function boot() {
+  video = document.getElementById('video');
+  overlayCanvas = document.getElementById('overlayCanvas');
+  overlayCtx = overlayCanvas.getContext('2d');
+
+  setInstructions('Getting ready…', 'Requesting camera access.');
+  const cameraOk = await initCamera();
+  if (!cameraOk) return;
+
+  // v67.9: see onVisibilityChange()'s comment -- backgrounding/foregrounding
+  // this tab mid-gesture could otherwise let elapsed background time (or a
+  // stale, frozen camera frame) silently satisfy the steady/gesture checks.
+  document.addEventListener('visibilitychange', onVisibilityChange);
+
+  await requestImuPermission();
+
+  // v67.2: enter the fixed prep countdown first, not steady_closed directly
+  // -- guide graphics (drawGuideOverlay, called every frame from mainLoop)
+  // are visible throughout this phase, so positioning can start immediately
+  // even though nothing is being measured yet.
+  setInstructions('Get ready', 'Position your closed passport in the frame using the guide.');
+  prepCountdownStartedAt = Date.now();
+  state = 'prep_countdown';
+  stateEnteredAt = Date.now();
+  logEvt('state_change', { to: state });
+
+  // Tesseract loads in the background during the countdown and the
+  // closed/open gesture -- by the time MRZ OCR is actually needed it's
+  // almost always ready, so this doesn't add visible wait time.
+  initTesseract().catch(e => logEvt('tesseract_init_error', { message: e.message }));
+
+  mainLoop();
+}
+
+window.addEventListener('load', boot);
+</script>
+</body>
+</html>

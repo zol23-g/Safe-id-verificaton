@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>2.7.18</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>com.safe</groupId>
+  <artifactId>safe-idv-demo</artifactId>
+  <version>1.0.0</version>
+  <name>safe-idv-demo</name>
+  <description>
+    Spring Boot port of the SAFE IDV Demo's mock_server.py + live_analysis.py.
+    See README.md for the full mapping back to the original Python files,
+    and for an important note about how this project was built (network
+    restrictions in the build sandbox meant Maven Central could not be
+    reached to actually compile/run this with a real `mvn package` before
+    handoff -- see README.md's "How this was built and verified" section).
+  </description>
+
+  <properties>
+    <!-- Spring Boot 2.7 is the final supported Spring Boot line for Java 11. -->
+    <java.version>11</java.version>
+    <maven.compiler.release>11</maven.compiler.release>
+    <!-- Retains StreamReadConstraints used to bound high-resolution image
+         data-URI parsing; Jackson 2.15 remains compatible with Java 11. -->
+    <jackson-bom.version>2.15.4</jackson-bom.version>
+  </properties>
+
+  <repositories>
+    <!-- Dynamsoft hosts its Java/native Barcode Reader SDK here. The SDK is
+         optional at runtime; enhanced Java ZXing stays active without a
+         license. -->
+    <repository>
+      <id>dynamsoft-dbr</id>
+      <url>https://download2.dynamsoft.com/maven/dbr/jar</url>
+    </repository>
+  </repositories>
+
+  <dependencies>
+    <!-- Web MVC with embedded Tomcat and Jackson JSON support -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+
+    <!-- PDF417 barcode decode: Java port of the same zxing-cpp logic
+         used in the Python version (ZXing's own core library, in fact
+         the library zxing-cpp itself wraps). -->
+    <dependency>
+      <groupId>com.google.zxing</groupId>
+      <artifactId>core</artifactId>
+      <version>3.5.3</version>
+    </dependency>
+    <dependency>
+      <groupId>com.google.zxing</groupId>
+      <artifactId>javase</artifactId>
+      <version>3.5.3</version>
+    </dependency>
+
+    <!-- Optional higher-tolerance local decoder. A blank server-side
+         safe.dynamsoft-license-key disables it; browser credentials are
+         never accepted. -->
+    <dependency>
+      <groupId>com.dynamsoft</groupId>
+      <artifactId>dbr</artifactId>
+      <version>11.4.1000</version>
+    </dependency>
+
+    <!-- Fuzzy string similarity: replaces Python's stdlib difflib.
+         LevenshteinDistance-based ratio is used to reproduce
+         difflib.SequenceMatcher's ratio() closely enough for this
+         prototype's address-comparison thresholds (see
+         ComparisonService.similarity() for the exact reasoning). -->
+    <dependency>
+      <groupId>org.apache.commons</groupId>
+      <artifactId>commons-text</artifactId>
+      <version>1.11.0</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <finalName>safe-idv-demo</finalName>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>
